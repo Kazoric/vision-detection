@@ -1,0 +1,11 @@
+/__pycache__/
+*.py[codz]
+*$py.class
+
+/data/
+/experiments/
+/checkpoints/
+/cifar-100-python/
+/stl10_binary/
+/plot_loss/
+/test.ipynb
