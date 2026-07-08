@@ -5,9 +5,12 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 from typing import Callable, Optional, List, Dict, Any
 
+import core.metrics as core_metrics
+from core.metrics import compute_dataset_tp_fp
+
 class Trainer:
     """
-    Classe pour entraîner un modèle de détection d'objets (ex: Faster R-CNN).
+    Classe pour entraîner un modèle de détection d'objets (ex: Faster R-CNN, SSD, YOLO).
     
     Attributes:
         model (nn.Module): Modèle de détection à entraîner
@@ -44,17 +47,17 @@ class Trainer:
         self.valid_loss = []
         self.lr_history = []
 
+        self.best_mAP = 0.0
         self.best_val_loss = float('inf')
         self.start_epoch = 0
         self.best_epoch_metrics: dict = {}
 
-        # Initialisation des métriques (ex: IoU, mAP)
+        # Initialisation des métriques (ex: IoU, mAP, F1-score)
         self.metrics = metrics if metrics else {}
-        self.train_metrics = {name: [] for name in self.metrics}
-        self.valid_metrics = {name: [] for name in self.metrics}
+        self.valid_metrics: Dict[str, list] = {}
 
     def train(self, train_loader: DataLoader, val_loader: Optional[DataLoader] = None, epochs: int = 10) -> None:
-        """ Train loop """
+        """ Boucle principale d'entraînement """
         for epoch in range(self.start_epoch, epochs):
 
             current_lr = self.optimizer.param_groups[0]['lr']
@@ -64,23 +67,19 @@ class Trainer:
             self.model.train()
             
             running_loss = 0.0
-            
-            # Listes pour accumuler les prédictions et cibles à des fins de calcul de métriques en fin d'époque
-            all_predictions = []
-            all_targets = []
 
             # Utilisation de tqdm pour la barre de progression
             pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}")
             for images, targets in pbar:
                 
-                # ADAPTATION : Transfert sur GPU/CPU pour des listes et dictionnaires
-                images = list(img.to(self.device, non_blocking=True) for img in images)
-                targets = [{k: v.to(self.device, non_blocking=True) for k, v in t.items()} for t in targets]
+                # Correction robuste : images est une liste/tuple de tenseurs. On envoie chaque image individuellement.
+                images_device = list(img.to(self.device, non_blocking=True) for img in images)
+                targets_device = [{k: v.to(self.device, non_blocking=True) for k, v in t.items()} for t in targets]
 
                 self.optimizer.zero_grad()
                 
                 # Le modèle renvoie un dictionnaire de pertes : loss_classifier, loss_box_reg, etc.
-                loss_dict = self.model(images, targets)
+                loss_dict = self.model(images_device, targets_device)
                 
                 # Somme de toutes les pertes du dictionnaire
                 losses = sum(loss for loss in loss_dict.values())
@@ -91,41 +90,32 @@ class Trainer:
                 running_loss += losses.item()
                 pbar.set_postfix({"batch_loss": f"{losses.item():.4f}"})
 
-                # Si on souhaite calculer des métriques d'entraînement, on doit repasser brièvement en eval 
-                # pour obtenir les boîtes prédites, mais cela ralentit l'entraînement. 
-                # Généralement en détection, on calcule les métriques uniquement sur la validation.
-                if self.metrics:
-                    all_targets.extend([{k: v.cpu() for k, v in t.items()} for t in targets])
-
             # Calcul de la perte moyenne de l'époque
             epoch_train_loss = running_loss / len(train_loader)
             self.train_loss.append(epoch_train_loss)
 
-            # Gestion facultative des métriques d'entraînement
-            metric_outputs = {}
-            if self.metrics:
-                # Si tu as besoin de prédictions d'entraînement, il faudrait exécuter une passe en eval.
-                # Pour l'instant on initialise à 0 ou on calcule si l'infrastructure le permet.
-                metric_outputs = {name: 0.0 for name in self.metrics} 
+            print(f"{'Train':<12} | Avg Loss: {epoch_train_loss:.4f} | Learning Rate: {current_lr:.6f}")
 
-            print(f"{'Train':<12} | Avg Loss: {epoch_train_loss:.4f} | Learning Rate: {current_lr:.4f}")
-
-            # Évaluation
+            # Évaluation et calcul des métriques globales de validation
             if val_loader:
-                val_loss = self.evaluate(val_loader)
+                val_loss, val_metrics = self.evaluate(val_loader)
+
+                current_mAP = val_metrics.get("mAP", 0.0)
 
                 # Sauvegarde du meilleur modèle basé sur la perte de validation
-                if self.save and val_loss < self.best_val_loss:
+                if self.save and current_mAP > self.best_mAP:
+                    self.best_mAP = current_mAP
                     self.best_val_loss = val_loss
 
                     self.best_epoch_metrics = {
                         "epoch": epoch + 1,
                         "train_loss": epoch_train_loss,
                         "val_loss": val_loss,
-                        "valid_metrics": {name: self.valid_metrics[name][-1] for name in self.metrics.keys()} if self.metrics else {}
+                        "val_metrics": val_metrics,
+                        "valid_metrics": {name: self.valid_metrics[name][-1] for name in self.valid_metrics.keys()} if self.valid_metrics else {}
                     }
                     if self.save_checkpoint:
-                        self.save_checkpoint(epoch + 1, val_loss)
+                        self.save_checkpoint(epoch + 1, current_mAP)
             
             if self.scheduler is not None:
                 self.scheduler.step()
@@ -147,50 +137,95 @@ class Trainer:
 
         with torch.no_grad():
             for images, targets in data_loader:
-                images = list(img.to(self.device, non_blocking=True) for img in images)
-                targets = [{k: v.to(self.device, non_blocking=True) for k, v in t.items()} for t in targets]
+                # Conversion robuste des listes d'images
+                images_device = list(img.to(self.device, non_blocking=True) for img in images)
+                targets_device = [{k: v.to(self.device, non_blocking=True) for k, v in t.items()} for t in targets]
                 
                 # Récupération des pertes de validation
-                loss_dict = self.model(images, targets)
+                loss_dict = self.model(images_device, targets_device)
                 losses = sum(loss for loss in loss_dict.values())
                 running_loss += losses.item()
 
-                # Pour les métriques de détection (mAP, IoU), il faut les prédictions réelles.
-                # On bascule temporairement en eval pour ce sous-batch si les métriques sont activées
+                # Pour les métriques de détection (mAP, IoU, F1), il faut les prédictions réelles.
                 if self.metrics:
                     self.model.eval()
-                    preds = self.model(images)
-                    self.model.train() # On rebascule immédiatement en train
+                    # Gestion robuste si le modèle possède une fonction predict custom (ex: notre YOLOModel)
+                    if hasattr(self.model, "predict"):
+                        preds = self.model.predict(images_device, confidence_threshold=0.15)
+                    else:
+                        preds = self.model(images_device)
+                        
+                    self.model.train() # Rebasculer immédiatement en train
                     
-                    # On stocke sur le CPU pour éviter d'asphyxier la VRAM
+                    # Stockage sur le CPU pour préserver la VRAM du GPU
                     all_preds.extend([{k: v.cpu() for k, v in p.items()} for p in preds])
                     all_targets.extend([{k: v.cpu() for k, v in t.items()} for t in targets])
 
         epoch_val_loss = running_loss / len(data_loader)
         self.valid_loss.append(epoch_val_loss)
 
-        # Calcul des métriques de détection (mAP / IoU) si fournies
+        # Calcul des métriques de détection (mAP / F1-Score / Precision / Recall)
         metrics_str = ""
         if self.metrics:
             metric_outputs = self._compute_metrics(all_targets, all_preds)
             for name, value in metric_outputs.items():
+                # Initialisation dynamique des clés de métriques si elles n'existent pas
+                if name not in self.valid_metrics:
+                    self.valid_metrics[name] = []
                 self.valid_metrics[name].append(value)
+                
             metrics_str = " | " + " | ".join(f"{name}: {value:.4f}" for name, value in metric_outputs.items())
 
         print(f"{'Validation':<12} | Avg Loss: {epoch_val_loss:.4f}{metrics_str}")
         
-        return epoch_val_loss
+        return epoch_val_loss, metric_outputs
+
 
     def _compute_metrics(self, targets: List[Dict[str, torch.Tensor]], predictions: List[Dict[str, torch.Tensor]]) -> Dict[str, float]:
         """
-        Calcule les métriques de détection.
-        targets et predictions sont des listes de dictionnaires contenant 'boxes' et 'labels'.
+        Calcule les métriques en extrayant les TP/FP une seule fois 
+        et en les injectant dans les fonctions cibles.
         """
         metric_outputs = {}
-        for name, (func, params) in self.metrics.items():
-            # Vos fonctions dans core/metrics.py devront accepter ces listes de dicts
-            score = func(targets, predictions, **params)
-            metric_outputs[name] = score
+        
+        # 1. Calcul UNIQUE du matching géométrique pour tout le lot/dataset
+        # On utilise le IoU threshold global de votre configuration (ex: 0.5)
+        iou_threshold = getattr(self.metrics, "params", {}).get("iou_threshold", 0.5)
+        
+        # Cette fonction noyau extrait tout le dictionnaire de données (cls_tp, cls_fp, etc.)
+        raw_data = compute_dataset_tp_fp(
+            predictions=predictions, 
+            targets=targets, 
+            num_classes=self.num_classes, 
+            iou_threshold=iou_threshold
+        )
+        
+        # 2. Distribution des TP/FP pré-calculés aux fonctions de métriques
+        for name, (func, params) in self.metrics.configs.items():
+            # ✨ CORRECTION : Si func est une chaîne, on récupère dynamiquement la vraie fonction
+            if isinstance(func, str):
+                if hasattr(core_metrics, func):
+                    func = getattr(core_metrics, func)
+                else:
+                    raise AttributeError(f"La fonction '{func}' est introuvable dans core.metrics")
+
+            # On fusionne les paramètres
+            full_kwargs = {
+                **raw_data, 
+                "num_classes": self.num_classes,
+                **params
+            }
+            
+            # Appel de la fonction avec le dictionnaire de paramètres complet
+            score = func(**full_kwargs)
+            
+            # Déballage standard des résultats
+            if isinstance(score, dict):
+                for k, v in score.items():
+                    metric_outputs[k] = v
+            else:
+                metric_outputs[name] = score
+                
         return metric_outputs
     
     def get_final_metrics(self) -> dict:

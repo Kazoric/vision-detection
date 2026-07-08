@@ -31,6 +31,10 @@ class SchedulerConfig:
     params: Dict[str, Any] = field(default_factory=dict)
 
 @dataclass
+class MetricsConfig:
+    configs: Dict[str, Any] = field(default_factory=dict)
+
+@dataclass
 class Config:
     """ Dataclass maîtresse regroupant toutes les sous-configurations """
     experiment: ExperimentConfig
@@ -38,6 +42,7 @@ class Config:
     training: TrainingConfig
     optimizer: OptimizerConfig
     scheduler: SchedulerConfig
+    metrics: MetricsConfig
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "Config":
@@ -47,5 +52,6 @@ class Config:
             model=ModelConfig(**d["model"]),
             training=TrainingConfig(**d["training"]),
             optimizer=OptimizerConfig(**d["optimizer"]),
-            scheduler=SchedulerConfig(**d.get("scheduler", {"type": None, "params": {}}))
+            scheduler=SchedulerConfig(**d.get("scheduler", {"type": None, "params": {}})),
+            metrics=MetricsConfig(configs=d.get("metrics", {}))
         )

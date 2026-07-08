@@ -2,8 +2,10 @@ import torch
 import torch.nn as nn
 import torchvision.models as models
 from torchvision.ops import nms
+from typing import List, Dict, Optional
+
 from core.config import Config
-from core.model_base import Model  # Ton modèle de base
+from core.model_base import Model  # Ton modèle de base abstrait
 
 
 class YOLOHead(nn.Module):
@@ -26,8 +28,8 @@ class YOLOHead(nn.Module):
 
 
 class SimplifiedYoloLoss(nn.Module):
-    """ Perte YOLO renvoyant un dictionnaire compatible avec ton Trainer """
-    def __init__(self, num_classes: int, grid_size: int = 10, coord_weight: float = 5.0, noobj_weight: float = 0.5):
+    """ Perte YOLO renvoyant un dictionnaire compatible avec le Trainer """
+    def __init__(self, num_classes: int, grid_size: int = 10, coord_weight: float = 10.0, noobj_weight: float = 0.1):
         super().__init__()
         self.num_classes = num_classes
         self.grid_size = grid_size
@@ -87,7 +89,6 @@ class SimplifiedYoloLoss(nn.Module):
             loss_box = torch.tensor(0.0, device=predictions.device, requires_grad=True)
             loss_class = torch.tensor(0.0, device=predictions.device, requires_grad=True)
             
-        # 🎯 C'EST ICI LA CLÉ : On renvoie un dictionnaire pour ton Trainer !
         return {
             "loss_obj": loss_obj,
             "loss_noobj": loss_noobj,
@@ -97,22 +98,20 @@ class SimplifiedYoloLoss(nn.Module):
 
 
 class YOLOResNetNetwork(nn.Module):
-    """ Réseau principal compatible avec l'interface de ton Trainer """
+    """ Réseau PyTorch YOLO brut imitant l'API des modèles torchvision """
     def __init__(self, num_classes: int, grid_size: int = 10, dropout: float = 0.1):
         super().__init__()
         self.grid_size = grid_size
         self.num_classes = num_classes
         
-        resnet = models.resnet34(pretrained=True)
+        resnet = models.resnet34(weights=models.ResNet34_Weights.DEFAULT)
         self.backbone = nn.Sequential(*list(resnet.children())[:-2])
         self.dropout = nn.Dropout2d(p=dropout) if dropout > 0 else nn.Identity()
         self.head = YOLOHead(in_channels=512, num_classes=num_classes, grid_size=grid_size)
         
-        # Le réseau possède sa propre fonction de perte
         self.criterion = SimplifiedYoloLoss(num_classes=num_classes, grid_size=grid_size)
         
     def forward(self, images, targets=None):
-        # 1. Empilage des images en tenseur si c'est une liste (comportement standard du DataLoader)
         if isinstance(images, list):
             images = torch.stack(images)
             
@@ -120,16 +119,80 @@ class YOLOResNetNetwork(nn.Module):
         features = self.dropout(features)
         predictions = self.head(features)
         
-        # 2. Si le modèle est en mode entraînement ET qu'on a des cibles : on renvoie le dictionnaire de pertes
+        # Mode entraînement : on retourne le dictionnaire de pertes
         if self.training and targets is not None:
             return self.criterion(predictions, targets)
             
-        # 3. Sinon (en évaluation / inférence), on renvoie les prédictions brutes
-        return predictions
+        # Mode évaluation : on retourne les prédictions décodées (format torchvision compatible)
+        return self.predict_decoded(predictions)
+
+    def predict_decoded(self, preds, confidence_threshold=0.15, iou_threshold=0.45, img_size=(300, 300)):
+        """ Décode les tenseurs bruts de la grille de prédiction en coordonnées d'images clippées """
+        B, _, S, S = preds.shape
+        img_w, img_h = img_size
+        device = preds.device
+        predictions_list = []
+        
+        for b in range(B):
+            pred_b = preds[b]
+            obj_scores = torch.sigmoid(pred_b[0])
+            boxes = pred_b[1:5]
+            class_probs = torch.softmax(pred_b[5:], dim=0)
+            
+            keep_mask = obj_scores > confidence_threshold
+            keep_indices = torch.nonzero(keep_mask)
+            
+            b_boxes, b_scores, b_labels = [], [], []
+            
+            for idx in keep_indices:
+                j, i = idx[0].item(), idx[1].item()
+                score = obj_scores[j, i].item()
+                xc, yc, w, h = boxes[:, j, i].cpu().numpy()
+                
+                # Exclusion de l'index 0 (Background) pour la détection active des classes d'échecs
+                class_id = torch.argmax(class_probs[1:, j, i]).item() + 1
+                
+                xmin = (xc - w / 2.0) * img_w
+                ymin = (yc - h / 2.0) * img_h
+                xmax = (xc + w / 2.0) * img_w
+                ymax = (yc + h / 2.0) * img_h
+                
+                # Clipping géométrique strict pour éviter tout débordement en dehors des limites physiques
+                xmin = max(0.0, min(xmin, float(img_w)))
+                ymin = max(0.0, min(ymin, float(img_h)))
+                xmax = max(0.0, min(xmax, float(img_w)))
+                ymax = max(0.0, min(ymax, float(img_h)))
+                
+                if (xmax - xmin) <= 0 or (ymax - ymin) <= 0:
+                    continue
+                    
+                b_boxes.append([xmin, ymin, xmax, ymax])
+                b_scores.append(score)
+                b_labels.append(class_id)
+                
+            if len(b_boxes) > 0:
+                t_boxes = torch.tensor(b_boxes, dtype=torch.float32, device=device)
+                t_scores = torch.tensor(b_scores, dtype=torch.float32, device=device)
+                t_labels = torch.tensor(b_labels, dtype=torch.long, device=device)
+                
+                keep_nms = nms(t_boxes, t_scores, iou_threshold)
+                predictions_list.append({
+                    "boxes": t_boxes[keep_nms],
+                    "scores": t_scores[keep_nms],
+                    "labels": t_labels[keep_nms]
+                })
+            else:
+                predictions_list.append({
+                    "boxes": torch.zeros((0, 4), dtype=torch.float32, device=device),
+                    "scores": torch.zeros(0, dtype=torch.float32, device=device),
+                    "labels": torch.zeros(0, dtype=torch.long, device=device)
+                })
+                
+        return predictions_list
 
 
 class YOLOModel(Model):
-    """ Modèle YOLO s'intégrant parfaitement dans ton framework """
+    """ Wrapper YOLOModel héritant de ta classe de base Model """
     def __init__(self, config: Config, grid_size: int = 10, dropout: float = 0.1, **kwargs):
         self.grid_size = grid_size
         self.dropout = dropout
@@ -171,61 +234,3 @@ class YOLOModel(Model):
             "input_size": (300, 300),
             "architecture": "YOLO_ResNet34"
         }
-
-    def predict(self, images, confidence_threshold=0.15, iou_threshold=0.45, img_size=(300, 300)):
-        """ Décodage des prédictions YOLO pour le Visualizer """
-        self.model.eval()
-        predictions_list = []
-        
-        batch_tensor = torch.stack([img.to(self.device) for img in images]) if isinstance(images, list) else images.to(self.device)
-        
-        with torch.no_grad():
-            preds = self.model(batch_tensor)
-            
-        B, _, S, S = preds.shape
-        
-        for b in range(B):
-            pred_b = preds[b]
-            obj_scores = torch.sigmoid(pred_b[0])
-            boxes = pred_b[1:5]
-            class_probs = torch.softmax(pred_b[5:], dim=0)
-            
-            keep_mask = obj_scores > confidence_threshold
-            keep_indices = torch.nonzero(keep_mask)
-            
-            b_boxes, b_scores, b_labels = [], [], []
-            
-            for idx in keep_indices:
-                j, i = idx[0].item(), idx[1].item()
-                score = obj_scores[j, i].item()
-                xc, yc, w, h = boxes[:, j, i].cpu().numpy()
-                class_id = torch.argmax(class_probs[:, j, i]).item()
-                
-                xmin = (xc - w / 2.0) * img_size[0]
-                ymin = (yc - h / 2.0) * img_size[1]
-                xmax = (xc + w / 2.0) * img_size[0]
-                ymax = (yc + h / 2.0) * img_size[1]
-                
-                b_boxes.append([xmin, ymin, xmax, ymax])
-                b_scores.append(score)
-                b_labels.append(class_id)
-                
-            if len(b_boxes) > 0:
-                t_boxes = torch.tensor(b_boxes, dtype=torch.float32, device=self.device)
-                t_scores = torch.tensor(b_scores, dtype=torch.float32, device=self.device)
-                t_labels = torch.tensor(b_labels, dtype=torch.long, device=self.device)
-                
-                keep_nms = nms(t_boxes, t_scores, iou_threshold)
-                predictions_list.append({
-                    "boxes": t_boxes[keep_nms].cpu(),
-                    "scores": t_scores[keep_nms].cpu(),
-                    "labels": t_labels[keep_nms].cpu()
-                })
-            else:
-                predictions_list.append({
-                    "boxes": torch.zeros((0, 4), dtype=torch.float32),
-                    "scores": torch.zeros(0, dtype=torch.float32),
-                    "labels": torch.zeros(0, dtype=torch.long)
-                })
-                
-        return predictions_list

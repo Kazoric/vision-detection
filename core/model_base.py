@@ -3,6 +3,7 @@ import json
 from datetime import datetime
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional, Tuple
+from dataclasses import asdict
 
 import torch
 import torch.nn as nn
@@ -10,13 +11,12 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import SequentialLR, LinearLR
 
-# Import de tes modules et de tes nouvelles dataclasses
+# Import des composants du framework
 from core.trainer import Trainer
 from core.predictor import Predictor
-# from core.checkpoint import CheckpointManager
+from core.checkpoint import CheckpointManager
 from core.config import Config
-# Assure-toi d'importer Config depuis là où tu l'as défini :
-# from core.config import Config 
+from core.metrics import detection_precision_recall_f1  # Importation de la suite de métriques de détection
 
 class Model(ABC):
     """
@@ -26,7 +26,7 @@ class Model(ABC):
     
     def __init__(self, config: Config, device: Optional[str] = None) -> None:
         """
-        Initialise le modèle avec une instance de la Dataclass Config.
+        Initialise le modèle avec une instance de la Dataclass Config et configure le Trainer.
         """
         self.config = config
         self.device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
@@ -80,25 +80,40 @@ class Model(ABC):
                     schedulers=[warmup_scheduler, main_scheduler],
                     milestones=[warm_up_epochs]
                 )
-                self.scheduler_name = f"Warmup+{sched_type}"
-                self.scheduler_params = {"warm_up_epochs": warm_up_epochs, "main_params": sched_params}
+                # self.scheduler_name = f"Warmup+{sched_type}"
+                # self.scheduler_params = {"warm_up_epochs": warm_up_epochs, "main_params": sched_params}
             else:
                 self.scheduler = scheduler_cls(self.optimizer, **sched_params)
-                self.scheduler_name = sched_type
-                self.scheduler_params = sched_params
+            self.scheduler_name = sched_type
+            self.scheduler_params = sched_params
 
-        # 6. Initialisation des gestionnaires coeurs (Core)
-        # self.checkpoint = CheckpointManager(
-        #     model=self.model, optimizer=self.optimizer, run_id=self.run_id, model_name=self.name
-        # )
+        self.metrics = config.metrics
+        # print()
+        # # 6. Configuration des métriques de détection par défaut si non fournies
+        # if self.metrics is None:
+        #     # On suit par défaut la suite globale F1-Score, Précision et Rappel
+        #     self.metrics = {
+        #         "detection_metrics": (
+        #             detection_precision_recall_f1,
+        #             {"num_classes": self.num_classes, "iou_threshold": 0.5}
+        #         )
+        #     }
+        # else:
+        #     self.metrics = metrics
 
+        self.checkpoint = CheckpointManager(
+            model=self.model, optimizer=self.optimizer, run_id=self.run_id, model_name=self.name
+        )
+
+        # 7. Initialisation du Trainer avec intégration des métriques configurées
         self.trainer = Trainer(
             model=self.model,
             optimizer=self.optimizer,
             device=self.device,
             save=config.experiment.save_checkpoints,
-            # checkpoint_fn=self.checkpoint.save,
+            checkpoint_fn=self.checkpoint.save,
             scheduler=self.scheduler,
+            metrics=self.metrics,
             num_classes=self.num_classes
         )
 
@@ -116,7 +131,7 @@ class Model(ABC):
     def train(self, train_loader: DataLoader, val_loader: Optional[DataLoader] = None, epochs: int = 10) -> None:
         self.trainer.train(train_loader, val_loader, epochs)
 
-    def evaluate(self, val_loader: DataLoader) -> Dict[str, float]:
+    def evaluate(self, val_loader: DataLoader) -> float:
         return self.trainer.evaluate(val_loader)
 
     def predict(self, images: List[torch.Tensor], confidence_threshold: float = 0.5) -> List[Dict[str, torch.Tensor]]:
@@ -131,26 +146,67 @@ class Model(ABC):
             all_targets.extend(targets)
         return all_targets, all_preds
 
-    def load_checkpoint(self, load_optimizer: bool = True) -> None:
-        success = self.checkpoint.load_latest(load_optimizer)
-        if success:
-            self.trainer.start_epoch = self.checkpoint.start_epoch
-            self.trainer.best_val_loss = self.checkpoint.best_val_loss
-
-    def save_hyperparams(self, batch_size: int, num_epochs: int) -> None:
-        """ Sauvegarde la configuration sous forme de JSON lisible dans les logs """
-        final_best_metrics = self.trainer.get_final_metrics()
+    def load_checkpoint(self, path: str, load_optimizer: bool = True) -> None:
+        """
+        Charge un checkpoint depuis un fichier .pth.
         
-        # dataclasses.asdict() convertirait l'objet en dict, mais pour rester sans dépendance,
-        # on peut simplement stocker les dictionnaires primitifs sous-jacents.
-        meta = {
+        Args:
+            path (str): Chemin vers le fichier checkpoint (.pth)
+            load_optimizer (bool): Si True, restaure aussi l'état de l'optimiseur
+        """
+        if not os.path.exists(path):
+            print(f"[WARNING] Checkpoint introuvable : {path}")
+            return
+        
+        checkpoint = torch.load(path, map_location=self.device)
+        self.model.load_state_dict(checkpoint["model_state_dict"])
+        
+        if load_optimizer and "optimizer_state_dict" in checkpoint:
+            self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        
+        if "epoch" in checkpoint:
+            self.trainer.start_epoch = checkpoint["epoch"]
+        if "best_val_loss" in checkpoint:
+            self.trainer.best_val_loss = checkpoint["best_val_loss"]
+        
+        print(f"[INFO] Checkpoint chargé depuis : {path}")
+
+    def save_checkpoint(self, epoch: int, val_loss: float) -> None:
+        """
+        Sauvegarde un checkpoint du modèle et de l'optimiseur.
+        """
+        save_dir = f"experiments/{self.run_id}"
+        os.makedirs(save_dir, exist_ok=True)
+        path = os.path.join(save_dir, "best_model.pth")
+        
+        torch.save({
+            "epoch": epoch,
+            "model_state_dict": self.model.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "best_val_loss": val_loss,
+        }, path)
+        print(f"[INFO] Checkpoint sauvegardé : {path}")
+
+    def save_hyperparams(self) -> None:
+        """ Sauvegarde la configuration sous forme de JSON structuré et lisible """
+        final_best_metrics = self.trainer.get_final_metrics()
+
+        # 1. On convertit automatiquement toute la structure Config en dictionnaire standard
+        meta = asdict(self.config)
+        
+        # Ajustement cosmétique : Remplacer le run_id initial par le run_id réel s'il a été généré dynamiquement
+        meta["experiment"]["run_id"] = self.run_id
+        
+        # 2. On ajoute le bloc de résultats d'exécution qui n'est pas dans la configuration initiale
+        meta["results"] = {
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "actual_run_id": self.run_id,
             "best_validation_results": final_best_metrics
         }
 
         path = os.path.join(f"experiments/{self.run_id}", "meta.json")
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w") as f:
-            json.dump(meta, f, indent=4)
-        print(f"[INFO] Métriques sauvegardées dans : {path}")
+        
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(meta, f, indent=4, ensure_ascii=False)
+            
+        print(f"[INFO] Métriques et configuration sauvegardées dans : {path}")
