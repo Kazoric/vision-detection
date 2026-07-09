@@ -102,7 +102,7 @@ class Model(ABC):
         #     self.metrics = metrics
 
         self.checkpoint = CheckpointManager(
-            model=self.model, optimizer=self.optimizer, run_id=self.run_id, model_name=self.name
+            model=self.model, optimizer=self.optimizer, run_id=self.run_id, model_name=self.name, monitor_metric=config.metrics.monitor_metric
         )
 
         # 7. Initialisation du Trainer avec intégration des métriques configurées
@@ -114,7 +114,9 @@ class Model(ABC):
             checkpoint_fn=self.checkpoint.save,
             scheduler=self.scheduler,
             metrics=self.metrics,
-            num_classes=self.num_classes
+            num_classes=self.num_classes,
+            monitor_metric=config.metrics.monitor_metric,
+            monitor_mode=config.metrics.monitor_mode
         )
 
         self.predictor = Predictor(self.model, self.device)

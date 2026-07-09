@@ -31,7 +31,9 @@ class Trainer:
         checkpoint_fn: Optional[Callable[[int, float], None]] = None,
         scheduler: Optional[optim.lr_scheduler.LRScheduler] = None,
         metrics: Optional[dict] = None,
-        num_classes: Optional[int] = None
+        num_classes: Optional[int] = None,
+        monitor_metric: str = "mAP",
+        monitor_mode: str = "max"
     ) -> None:
         
         self.model = model
@@ -42,12 +44,16 @@ class Trainer:
         self.scheduler = scheduler
         self.num_classes = num_classes
 
+        self.monitor_metric = monitor_metric
+        self.monitor_mode = monitor_mode.lower()
+        assert self.monitor_mode in ["max", "min"], "monitor_mode doit être 'max' ou 'min'"
+
         # Suivi des pertes moyennes par époque
         self.train_loss = []
         self.valid_loss = []
         self.lr_history = []
 
-        self.best_mAP = 0.0
+        self.best_metric_value = float('-inf') if self.monitor_mode == "max" else float('inf')
         self.best_val_loss = float('inf')
         self.start_epoch = 0
         self.best_epoch_metrics: dict = {}
@@ -100,11 +106,22 @@ class Trainer:
             if val_loader:
                 val_loss, val_metrics = self.evaluate(val_loader)
 
-                current_mAP = val_metrics.get("mAP", 0.0)
+                if self.monitor_metric in ["loss", "val_loss"]:
+                    current_metric_val = val_loss
+                else:
+                    # Valeur par défaut logique en cas d'absence de la clé
+                    default_val = float('-inf') if self.monitor_mode == "max" else float('inf')
+                    current_metric_val = val_metrics.get(self.monitor_metric, default_val)
 
-                # Sauvegarde du meilleur modèle basé sur la perte de validation
-                if self.save and current_mAP > self.best_mAP:
-                    self.best_mAP = current_mAP
+                is_better = False
+                if self.monitor_mode == "max" and current_metric_val > self.best_metric_value:
+                    is_better = True
+                elif self.monitor_mode == "min" and current_metric_val < self.best_metric_value:
+                    is_better = True
+
+                # Sauvegarde du meilleur modèle basé sur la métrique choisie
+                if self.save and is_better:
+                    self.best_metric_value = current_metric_val
                     self.best_val_loss = val_loss
 
                     self.best_epoch_metrics = {
@@ -112,10 +129,12 @@ class Trainer:
                         "train_loss": epoch_train_loss,
                         "val_loss": val_loss,
                         "val_metrics": val_metrics,
-                        "valid_metrics": {name: self.valid_metrics[name][-1] for name in self.valid_metrics.keys()} if self.valid_metrics else {}
+                        "monitor_metric": self.monitor_metric,
+                        "monitor_value": current_metric_val,
+                        # "valid_metrics": {name: self.valid_metrics[name][-1] for name in self.valid_metrics.keys()} if self.valid_metrics else {}
                     }
                     if self.save_checkpoint:
-                        self.save_checkpoint(epoch + 1, current_mAP)
+                        self.save_checkpoint(epoch + 1, current_metric_val)
             
             if self.scheduler is not None:
                 self.scheduler.step()

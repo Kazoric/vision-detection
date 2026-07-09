@@ -32,7 +32,11 @@ class SchedulerConfig:
 
 @dataclass
 class MetricsConfig:
-    configs: Dict[str, Any] = field(default_factory=dict)
+    monitor_metric: str = "mAP"
+    monitor_mode: str = "max"
+    configs: Dict[str, Any] = field(
+        default_factory=lambda: {"mAP": ("raw_compute_map", {"iou_threshold": 0.5})}
+    )
 
 @dataclass
 class Config:
@@ -47,11 +51,20 @@ class Config:
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "Config":
         """ Crée récursivement l'objet Config depuis un dictionnaire standard (ex: YAML) """
+        metrics_raw = d.get("metrics", {}).copy()
+        
+        monitor_metric = metrics_raw.pop("monitor_metric", "mAP")
+        monitor_mode = metrics_raw.pop("monitor_mode", "max")
+        
         return cls(
             experiment=ExperimentConfig(**d["experiment"]),
             model=ModelConfig(**d["model"]),
             training=TrainingConfig(**d["training"]),
             optimizer=OptimizerConfig(**d["optimizer"]),
             scheduler=SchedulerConfig(**d.get("scheduler", {"type": None, "params": {}})),
-            metrics=MetricsConfig(configs=d.get("metrics", {}))
+            metrics=MetricsConfig(
+                monitor_metric=monitor_metric,
+                monitor_mode=monitor_mode,
+                configs=metrics_raw
+            )
         )
