@@ -23,7 +23,8 @@ class CheckpointManager:
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'epoch': epoch,
-            self.monitor_metric: score
+            'monitor_metric_score': score,
+            'monitor_metric_name': self.monitor_metric
         }
         path = os.path.join(self.checkpoint_dir, f"{self.model_name}_best.pt")
         torch.save(checkpoint, path)
@@ -41,6 +42,7 @@ class CheckpointManager:
             self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         
         self.start_epoch = checkpoint['epoch']
-        self.best_val_loss = checkpoint['val_loss']
-        print(f"[INFO] Checkpoint chargé : époques {self.start_epoch}, loss {self.best_val_loss:.4f}")
+        self.monitor_metric_score = checkpoint['monitor_metric_score']
+        self.monitor_metric_name = checkpoint['monitor_metric_name']
+        print(f"[INFO] Checkpoint chargé : époques {self.start_epoch}, {self.monitor_metric_name} : {self.monitor_metric_score:.4f}")
         return True

@@ -138,22 +138,27 @@ class Model(ABC):
         return all_targets, all_preds
 
     def load_checkpoint(self, path: str, load_optimizer: bool = True) -> None:
-        if not os.path.exists(path):
-            print(f"[WARNING] Checkpoint introuvable : {path}")
-            return
+        # if not os.path.exists(path):
+        #     print(f"[WARNING] Checkpoint introuvable : {path}")
+        #     return
         
-        checkpoint = torch.load(path, map_location=self.device)
-        self.model.load_state_dict(checkpoint["model_state_dict"])
+        # checkpoint = torch.load(path, map_location=self.device)
+        # self.model.load_state_dict(checkpoint["model_state_dict"])
         
-        if load_optimizer and "optimizer_state_dict" in checkpoint:
-            self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        # if load_optimizer and "optimizer_state_dict" in checkpoint:
+        #     self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         
-        if "epoch" in checkpoint:
-            self.trainer.start_epoch = checkpoint["epoch"]
-        if "best_val_loss" in checkpoint:
-            self.trainer.best_val_loss = checkpoint["best_val_loss"]
+        # if "epoch" in checkpoint:
+        #     self.trainer.start_epoch = checkpoint["epoch"]
+        # if "best_val_loss" in checkpoint:
+        #     self.trainer.best_val_loss = checkpoint["best_val_loss"]
         
-        print(f"[INFO] Checkpoint chargé depuis : {path}")
+        # print(f"[INFO] Checkpoint chargé depuis : {path}")
+
+        success = self.checkpoint.load_latest(load_optimizer)
+        if success:
+            self.trainer.start_epoch = self.checkpoint.start_epoch
+            self.trainer.best_metric_value = self.checkpoint.monitor_metric_score
 
     def save_checkpoint(self, epoch: int, val_loss: float) -> None:
         save_dir = f"experiments/{self.run_id}"
@@ -173,6 +178,14 @@ class Model(ABC):
         final_best_metrics = self.trainer.get_final_metrics()
 
         meta = asdict(self.config)
+
+        metrics = meta["metrics"]
+        configs = metrics.pop("configs", {})
+        meta["metrics"].update({
+            name: tuple(value)
+            for name, value in configs.items()
+        })
+
         meta["experiment"]["run_id"] = self.run_id
         
         meta["results"] = {
