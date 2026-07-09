@@ -16,7 +16,6 @@ from core.trainer import Trainer
 from core.predictor import Predictor
 from core.checkpoint import CheckpointManager
 from core.config import Config
-from core.metrics import detection_precision_recall_f1  # Importation de la suite de métriques de détection
 
 class Model(ABC):
     """
@@ -50,29 +49,25 @@ class Model(ABC):
         opt_type = config.optimizer.type
         opt_params = config.optimizer.params
         optimizer_cls = getattr(optim, opt_type)
-        
-        self.optimizer_name = opt_type
-        self.optimizer_params = opt_params
         self.optimizer = optimizer_cls(self.model.parameters(), lr=self.lr, **opt_params)
 
-        # 5. Initialisation du Scheduler
+        # 5. Initialisation du Scheduler (Logique épurée)
         self.scheduler = None
-        self.scheduler_name = None
-        self.scheduler_params = {}
+        has_main_scheduler = config.scheduler.type is not None
+        has_warmup = config.training.warm_up_epochs > 0
 
-        if config.scheduler.type is not None:
-            sched_type = config.scheduler.type
-            sched_params = config.scheduler.params
-            scheduler_cls = getattr(optim.lr_scheduler, sched_type)
+        if has_warmup:
+            warm_up_epochs = config.training.warm_up_epochs
+            self.optimizer.param_groups[0]['lr'] = self.lr
             
-            # Gestion du Warm-up linéaire
-            if config.training.warm_up:
-                warm_up_epochs = config.training.warm_up_epochs
-                
-                self.optimizer.param_groups[0]['lr'] = self.lr
-                warmup_scheduler = LinearLR(
-                    self.optimizer, start_factor=0.05, end_factor=1.0, total_iters=warm_up_epochs
-                )
+            warmup_scheduler = LinearLR(
+                self.optimizer, start_factor=0.05, end_factor=1.0, total_iters=warm_up_epochs
+            )
+            
+            if has_main_scheduler:
+                sched_type = config.scheduler.type
+                sched_params = config.scheduler.params
+                scheduler_cls = getattr(optim.lr_scheduler, sched_type)
                 main_scheduler = scheduler_cls(self.optimizer, **sched_params)
                 
                 self.scheduler = SequentialLR(
@@ -80,32 +75,26 @@ class Model(ABC):
                     schedulers=[warmup_scheduler, main_scheduler],
                     milestones=[warm_up_epochs]
                 )
-                # self.scheduler_name = f"Warmup+{sched_type}"
-                # self.scheduler_params = {"warm_up_epochs": warm_up_epochs, "main_params": sched_params}
             else:
-                self.scheduler = scheduler_cls(self.optimizer, **sched_params)
-            self.scheduler_name = sched_type
-            self.scheduler_params = sched_params
+                self.scheduler = warmup_scheduler
 
+        elif has_main_scheduler:
+            sched_type = config.scheduler.type
+            sched_params = config.scheduler.params
+            scheduler_cls = getattr(optim.lr_scheduler, sched_type)
+            self.scheduler = scheduler_cls(self.optimizer, **sched_params)
+
+        # 6. Gestion des métriques et des checkpoints
         self.metrics = config.metrics
-        # print()
-        # # 6. Configuration des métriques de détection par défaut si non fournies
-        # if self.metrics is None:
-        #     # On suit par défaut la suite globale F1-Score, Précision et Rappel
-        #     self.metrics = {
-        #         "detection_metrics": (
-        #             detection_precision_recall_f1,
-        #             {"num_classes": self.num_classes, "iou_threshold": 0.5}
-        #         )
-        #     }
-        # else:
-        #     self.metrics = metrics
-
         self.checkpoint = CheckpointManager(
-            model=self.model, optimizer=self.optimizer, run_id=self.run_id, model_name=self.name, monitor_metric=config.metrics.monitor_metric
+            model=self.model, 
+            optimizer=self.optimizer, 
+            run_id=self.run_id, 
+            model_name=self.name, 
+            monitor_metric=config.metrics.monitor_metric
         )
 
-        # 7. Initialisation du Trainer avec intégration des métriques configurées
+        # 7. Initialisation du Trainer
         self.trainer = Trainer(
             model=self.model,
             optimizer=self.optimizer,
@@ -149,13 +138,6 @@ class Model(ABC):
         return all_targets, all_preds
 
     def load_checkpoint(self, path: str, load_optimizer: bool = True) -> None:
-        """
-        Charge un checkpoint depuis un fichier .pth.
-        
-        Args:
-            path (str): Chemin vers le fichier checkpoint (.pth)
-            load_optimizer (bool): Si True, restaure aussi l'état de l'optimiseur
-        """
         if not os.path.exists(path):
             print(f"[WARNING] Checkpoint introuvable : {path}")
             return
@@ -174,9 +156,6 @@ class Model(ABC):
         print(f"[INFO] Checkpoint chargé depuis : {path}")
 
     def save_checkpoint(self, epoch: int, val_loss: float) -> None:
-        """
-        Sauvegarde un checkpoint du modèle et de l'optimiseur.
-        """
         save_dir = f"experiments/{self.run_id}"
         os.makedirs(save_dir, exist_ok=True)
         path = os.path.join(save_dir, "best_model.pth")
@@ -193,13 +172,9 @@ class Model(ABC):
         """ Sauvegarde la configuration sous forme de JSON structuré et lisible """
         final_best_metrics = self.trainer.get_final_metrics()
 
-        # 1. On convertit automatiquement toute la structure Config en dictionnaire standard
         meta = asdict(self.config)
-        
-        # Ajustement cosmétique : Remplacer le run_id initial par le run_id réel s'il a été généré dynamiquement
         meta["experiment"]["run_id"] = self.run_id
         
-        # 2. On ajoute le bloc de résultats d'exécution qui n'est pas dans la configuration initiale
         meta["results"] = {
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "best_validation_results": final_best_metrics

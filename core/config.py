@@ -17,8 +17,7 @@ class TrainingConfig:
     lr: float
     batch_size: int
     epochs: int
-    warm_up: bool = False
-    warm_up_epochs: int = 5
+    warm_up_epochs: int = 0
 
 @dataclass
 class OptimizerConfig:
