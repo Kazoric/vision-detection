@@ -1,12 +1,13 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torchvision.models import resnet50, ResNet50_Weights
-from torchvision.models.feature_extraction import create_feature_extractor
-from typing import List, Dict, Tuple, Optional
+from torchvision.ops import batched_nms
+from typing import List, Dict
 
 from core.config import Config
 from core.model_base import Model
+from loss.ssd_loss import SSDMultiBoxLoss
+from utils.ssd_utils import generate_ssd_priors
 
 
 class L2Norm(nn.Module):
@@ -22,157 +23,6 @@ class L2Norm(nn.Module):
         norm = x.pow(2).sum(dim=1, keepdim=True).sqrt() + 1e-10
         x = torch.div(x, norm)
         return self.gamma.unsqueeze(0).unsqueeze(2).unsqueeze(3) * x
-
-def generate_ssd_priors() -> torch.Tensor:
-    """ Generates default 8732 anchor boxes for SSD300 in [cx, cy, w, h] normalized coordinates """
-    feature_maps = [38, 19, 10, 5, 3, 1]
-    steps = [8, 16, 32, 64, 100, 300]
-    min_sizes = [30, 60, 111, 162, 213, 264]
-    max_sizes = [60, 111, 162, 213, 264, 315]
-    aspect_ratios = [
-        [2],           # 38x38 (4 boîtes)
-        [2, 3],        # 19x19 (6 boîtes)
-        [2, 3],        # 10x10 (6 boîtes)
-        [2, 3],        # 5x5   (6 boîtes)
-        [2],           # 3x3   (4 boîtes)
-        [2]            # 1x1   (4 boîtes)
-    ]
-
-    priors = []
-    for k, f in enumerate(feature_maps):
-        for i in range(f):
-            for j in range(f):
-                cx = (j + 0.5) / f
-                cy = (i + 0.5) / f
-
-                # Boîte de taille min
-                s_k = min_sizes[k] / 300.0
-                priors.append([cx, cy, s_k, s_k])
-
-                # Boîte supplémentaire s'_k = sqrt(s_k * s_{k+1})
-                s_k_prime = (s_k * (max_sizes[k] / 300.0)) ** 0.5
-                priors.append([cx, cy, s_k_prime, s_k_prime])
-
-                # Ratio d'aspects
-                for ar in aspect_ratios[k]:
-                    priors.append([cx, cy, s_k * (ar ** 0.5), s_k / (ar ** 0.5)])
-                    priors.append([cx, cy, s_k / (ar ** 0.5), s_k * (ar ** 0.5)])
-
-    priors = torch.tensor(priors, dtype=torch.float32)
-    return torch.clamp(priors, 0.0, 1.0)
-
-
-def intersect(box_a: torch.Tensor, box_b: torch.Tensor) -> torch.Tensor:
-    """ Intersection entre 2 ensembles de boîtes [xmin, ymin, xmax, ymax] """
-    A = box_a.size(0)
-    B = box_b.size(0)
-    max_xy = torch.min(box_a[:, 2:].unsqueeze(1).expand(A, B, 2), box_b[:, 2:].unsqueeze(0).expand(A, B, 2))
-    min_xy = torch.max(box_a[:, :2].unsqueeze(1).expand(A, B, 2), box_b[:, :2].unsqueeze(0).expand(A, B, 2))
-    inter = torch.clamp((max_xy - min_xy), min=0)
-    return inter[:, :, 0] * inter[:, :, 1]
-
-
-def jaccard_iou(box_a: torch.Tensor, box_b: torch.Tensor) -> torch.Tensor:
-    """ Calcul de l'IoU entre box_a et box_b """
-    inter = intersect(box_a, box_b)
-    area_a = ((box_a[:, 2] - box_a[:, 0]) * (box_a[:, 3] - box_a[:, 1])).unsqueeze(1).expand_as(inter)
-    area_b = ((box_b[:, 2] - box_b[:, 0]) * (box_b[:, 3] - box_b[:, 1])).unsqueeze(0).expand_as(inter)
-    union = area_a + area_b - inter
-    return inter / union
-
-class SSDMultiBoxLoss(nn.Module):
-    """ Perte SSD MultiBox compatible avec la structure du Trainer YOLO """
-    def __init__(self, num_classes: int, overlap_thresh: float = 0.5, neg_pos_ratio: float = 3.0):
-        super().__init__()
-        self.num_classes = num_classes
-        self.overlap_thresh = overlap_thresh
-        self.neg_pos_ratio = neg_pos_ratio
-        self.variances = [0.1, 0.2]
-
-    def forward(self, loc_preds: torch.Tensor, cls_preds: torch.Tensor, targets: List[Dict], priors: torch.Tensor, img_size=(300, 300)) -> Dict[str, torch.Tensor]:
-        B, num_priors, _ = loc_preds.shape
-        device = loc_preds.device
-        img_w, img_h = img_size
-
-        # Conversion des priors [cx, cy, w, h] vers [xmin, ymin, xmax, ymax]
-        priors_corner = torch.zeros_like(priors)
-        priors_corner[:, :2] = priors[:, :2] - priors[:, 2:] / 2.0
-        priors_corner[:, 2:] = priors[:, :2] + priors[:, 2:] / 2.0
-
-        loc_targets = torch.zeros_like(loc_preds)
-        cls_targets = torch.zeros((B, num_priors), dtype=torch.long, device=device)
-
-        # Matching Ground Truth / Priors pour chaque image du batch
-        for b in range(B):
-            gt_boxes = targets[b]["boxes"]
-            labels = targets[b]["labels"]
-
-            if len(gt_boxes) == 0:
-                continue
-
-            # Normalisation des coordonnées [xmin, ymin, xmax, ymax] dans [0, 1]
-            gt_boxes_norm = gt_boxes.clone()
-            gt_boxes_norm[:, [0, 2]] /= float(img_w)
-            gt_boxes_norm[:, [1, 3]] /= float(img_h)
-
-            overlaps = jaccard_iou(gt_boxes_norm, priors_corner) # [num_gt, num_priors]
-            
-            best_prior_overlap, best_prior_idx = overlaps.max(1)
-            best_truth_overlap, best_truth_idx = overlaps.max(0)
-
-            # Assurer que chaque GT a au moins 1 prior associé
-            for idx, prior_idx in enumerate(best_prior_idx):
-                best_truth_idx[prior_idx] = idx
-                best_truth_overlap[prior_idx] = 2.0
-
-            # Label 0 est réservé au Background dans SSD
-            assigned_labels = labels[best_truth_idx]
-            assigned_labels[best_truth_overlap < self.overlap_thresh] = 0
-            cls_targets[b] = assigned_labels
-
-            # Encodage des offsets de localisation
-            matched_gt = gt_boxes_norm[best_truth_idx]
-            gt_cxcy = (matched_gt[:, :2] + matched_gt[:, 2:]) / 2.0
-            gt_wh = matched_gt[:, 2:] - matched_gt[:, :2]
-            
-            g_hat_cxcy = (gt_cxcy - priors[:, :2]) / (priors[:, 2:] * self.variances[0])
-            g_hat_wh = torch.log(gt_wh / priors[:, 2:] + 1e-5) / self.variances[1]
-            loc_targets[b] = torch.cat([g_hat_cxcy, g_hat_wh], dim=1)
-
-        pos_mask = cls_targets > 0 # [B, num_priors]
-        num_pos = pos_mask.sum()
-
-        # 1. Smooth L1 Localization Loss
-        if num_pos > 0:
-            loss_box = F.smooth_l1_loss(loc_preds[pos_mask], loc_targets[pos_mask], reduction='sum') / B
-        else:
-            loss_box = torch.tensor(0.0, device=device, requires_grad=True)
-
-        # 2. Hard Negative Mining pour la Classification Loss (Ratio Neg/Pos = 3:1)
-        cls_loss_all = F.cross_entropy(cls_preds.view(-1, self.num_classes), cls_targets.view(-1), reduction='none')
-        cls_loss_all = cls_loss_all.view(B, num_priors)
-
-        # Filtre des positifs
-        cls_loss_neg = cls_loss_all.clone()
-        cls_loss_neg[pos_mask] = 0.0 
-
-        _, loss_idx = cls_loss_neg.sort(1, descending=True)
-        _, idx_rank = loss_idx.sort(1)
-
-        num_pos_per_img = pos_mask.sum(1, keepdim=True)
-        num_neg_per_img = torch.clamp(num_pos_per_img * self.neg_pos_ratio, max=num_priors - 1).long()
-        neg_mask = idx_rank < num_neg_per_img
-
-        # Perte Totale de Classification (Positifs + Negatifs sélectionnés)
-        final_mask = pos_mask | neg_mask
-        loss_class = cls_loss_all[final_mask].sum() / B
-
-        return {
-            "loss_box": loss_box,
-            "loss_class": loss_class,
-            "loss_obj": torch.tensor(0.0, device=device),    # Maintient la compatibilité
-            "loss_noobj": torch.tensor(0.0, device=device)  # Maintient la compatibilité
-        }
 
 class SSDVGG16Backbone(nn.Module):
     def __init__(self, num_classes):
@@ -406,7 +256,6 @@ class SSDVGG16Model(Model):
     def __init__(self, config: Config, score_thresh: float = 0.15, iou_thresh: float = 0.45, **kwargs):
         self.score_thresh = score_thresh
         self.iou_thresh = iou_thresh
-        # SSD300 also uses multi-scale feature maps, so no grid_size needed here either
         super().__init__(config=config, **kwargs)
 
     @property
@@ -415,164 +264,13 @@ class SSDVGG16Model(Model):
 
     def build_model(self) -> nn.Module:
         print(f"[INFO] Building SSD300 VGG16 Network (Native resolution: 300x300)...")
-
-        model = SSDVGG16Backbone(num_classes=self.num_classes)
-
-        # self.post_processor = SSDPostProcessor(
-        #     score_thresh=self.score_thresh, 
-        #     iou_thresh=self.iou_thresh
-        # )
-
-        # model.priors = generate_ssd_priors().to(config.device)
-        
-        return model
-    
-    # def setup_post_processing(self):
-    #     # On instancie le processeur dédié
-    #     self.post_processor = SSDPostProcessor(
-    #         score_thresh=self.score_thresh, 
-    #         iou_thresh=self.iou_thresh
-    #     )
+        return SSDVGG16Backbone(num_classes=self.num_classes)
 
     def get_model_specific_params(self) -> dict:
         return {
             "num_classes": self.num_classes,
             "score_thresh": self.score_thresh,
             "iou_thresh": self.iou_thresh,
-            "input_size": (300, 300),  # The original VGG16 SSD is calibrated for 300x300
+            "input_size": (300, 300),
             "architecture": "SSD_VGG16"
         }
-    
-
-from torchvision.ops import batched_nms
-
-class SSDPostProcessor:
-    def __init__(self, score_thresh: float = 0.15, iou_thresh: float = 0.45, background_label: int = 0):
-        """
-        Args:
-            score_thresh (float): Minimum confidence score to consider a detection valid.
-            iou_thresh (float): Overlap threshold for Non-Maximum Suppression (NMS).
-            background_label (int): Index of the background class (usually 0 in SSD).
-        """
-        self.score_thresh = score_thresh
-        self.iou_thresh = iou_thresh
-        self.background_label = background_label
-        
-        # Standard SSD variances used during encoding/decoding stabilization
-        self.variances = [0.1, 0.1, 0.2, 0.2]
-
-    def decode_boxes(self, loc_preds: torch.Tensor, priors: torch.Tensor) -> torch.Tensor:
-        """
-        Converts predicted localization offsets into absolute bounding box coordinates [xmin, ymin, xmax, ymax].
-        
-        Args:
-            loc_preds (Tensor): Predicted offsets with shape [Batch, 8732, 4]
-            priors (Tensor): Default anchor boxes with shape [8732, 4] in [cx, cy, w, h] format
-            
-        Returns:
-            Tensor: Decoded boxes with shape [Batch, 8732, 4] in [xmin, ymin, xmax, ymax] format
-        """
-        # Extract prior center and dimensions
-        priors_cx = priors[:, 0]
-        priors_cy = priors[:, 1]
-        priors_w  = priors[:, 2]
-        priors_h  = priors[:, 3]
-
-        # Apply inverse transformation formulas using broadcasting over the batch dimension
-        cx = loc_preds[..., 0] * self.variances[0] * priors_w + priors_cx
-        cy = loc_preds[..., 1] * self.variances[1] * priors_h + priors_cy
-        w  = torch.exp(loc_preds[..., 2] * self.variances[2]) * priors_w
-        h  = torch.exp(loc_preds[..., 3] * self.variances[3]) * priors_h
-
-        # Convert [cx, cy, w, h] format into standard coordinate format [xmin, ymin, xmax, ymax]
-        decoded_boxes = torch.zeros_like(loc_preds)
-        decoded_boxes[..., 0] = cx - w / 2.0  # xmin
-        decoded_boxes[..., 1] = cy - h / 2.0  # ymin
-        decoded_boxes[..., 2] = cx + w / 2.0  # xmax
-        decoded_boxes[..., 3] = cy + h / 2.0  # ymax
-
-        # Clip coordinates to keep them inside a normalized [0, 1] frame boundary
-        return torch.clamp(decoded_boxes, min=0.0, max=1.0)
-
-    def __call__(self, loc_preds: torch.Tensor, cls_preds: torch.Tensor, priors: torch.Tensor) -> list:
-        """
-        Processes raw model outputs to yield final filtered detections per batch item.
-        
-        Args:
-            loc_preds (Tensor): Raw localization tensor from model forward [Batch, 8732, 4]
-            cls_preds (Tensor): Raw classification logits from model forward [Batch, 8732, num_classes]
-            priors (Tensor): Default anchor coordinates [8732, 4]
-            
-        Returns:
-            list of dict: A list containing detection dictionaries for each image in the batch.
-                          Each dict contains keys: 'boxes', 'scores', and 'labels'.
-        """
-        batch_size = loc_preds.size(0)
-        num_classes = cls_preds.size(2)
-        
-        # 1. Decode all boxes for the entire batch
-        all_decoded_boxes = self.decode_boxes(loc_preds, priors)
-        
-        # 2. Compute probabilities using Softmax over the class logits
-        all_cls_scores = torch.softmax(cls_preds, dim=-1)
-        
-        batch_results = []
-
-        # Process each image in the batch individually since final detection counts vary
-        for i in range(batch_size):
-            img_boxes = all_decoded_boxes[i]       # Shape: [8732, 4]
-            img_scores = all_cls_scores[i]        # Shape: [8732, num_classes]
-
-            # Lists to stack valid predictions before applying global NMS
-            valid_boxes = []
-            valid_scores = []
-            valid_labels = []
-
-            # Iterate through all object classes, completely skipping background (label 0)
-            for c in range(num_classes):
-                if c == self.background_label:
-                    continue
-                
-                class_scores = img_scores[:, c]
-                score_mask = class_scores > self.score_thresh
-                
-                if score_mask.sum() == 0:
-                    continue
-                
-                # Extract coordinates and scores matching our filter criteria
-                valid_boxes.append(img_boxes[score_mask])
-                valid_scores.append(class_scores[score_mask])
-                # Generate matching categorical labels for tracking inside the NMS step
-                valid_labels.append(torch.full_like(class_scores[score_mask], fill_value=c, dtype=torch.long))
-
-            # If no boxes passed the confidence threshold across any class, return empty tensors
-            if len(valid_boxes) == 0:
-                batch_results.append({
-                    "boxes": torch.empty((0, 4), device=loc_preds.device),
-                    "scores": torch.empty((0,), device=loc_preds.device),
-                    "labels": torch.empty((0,), dtype=torch.long, device=loc_preds.device)
-                })
-                continue
-
-            # Concatenate collected class arrays into consolidated single tensors
-            final_img_boxes = torch.cat(valid_boxes, dim=0)
-            final_img_scores = torch.cat(valid_scores, dim=0)
-            final_img_labels = torch.cat(valid_labels, dim=0)
-
-            # 3. Apply Multi-Class Batched NMS
-            # batched_nms separates objects natively by class index to avoid cross-class masking
-            keep_indices = batched_nms(
-                boxes=final_img_boxes,
-                scores=final_img_scores,
-                idxs=final_img_labels,
-                iou_threshold=self.iou_thresh
-            )
-
-            # Extract the actual post-processed safe outputs
-            batch_results.append({
-                "boxes": final_img_boxes[keep_indices],
-                "scores": final_img_scores[keep_indices],
-                "labels": final_img_labels[keep_indices]
-            })
-
-        return batch_results
