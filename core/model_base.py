@@ -2,201 +2,143 @@ import os
 import json
 from datetime import datetime
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, Optional
 from dataclasses import asdict
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import SequentialLR, LinearLR
 
-# Import des composants du framework
-from core.trainer import Trainer
-from core.predictor import Predictor
-from core.checkpoint import CheckpointManager
 from core.config import Config
 
-class Model(ABC):
-    """
-    Classe de base abstraite pour les modèles de détection.
-    Initialisation et gestion pilotées par une Dataclass de configuration stricte.
-    """
-    
-    def __init__(self, config: Config, device: Optional[str] = None) -> None:
-        """
-        Initialise le modèle avec une instance de la Dataclass Config et configure le Trainer.
-        """
-        self.config = config
-        self.device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
 
-        # 1. Extraction propre des attributs typés
+class Model(nn.Module, ABC):
+    """
+    Abstract base class for all detection models, inheriting from nn.Module.
+
+    Responsibilities:
+      - Define the common abstract interface (name, _build_architecture, forward)
+      - Call _build_architecture() so that the subclass instantiates its PyTorch layers
+      - Move the module to the device (cuda / cpu)
+      - Initialize the optimizer (self.optimizer) and the scheduler (self.scheduler)
+      - Handle the run_id and save the meta-configuration (save_hyperparams)
+    """
+
+    def __init__(self, config: Config, device: Optional[str] = None) -> None:
+        super().__init__()
+        self.config = config
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+
+        # --- Attributes extracted from the config ---
         self.num_classes = config.model.num_classes
         self.dataset_name = config.experiment.dataset_name
         self.lr = config.training.lr
-        
-        # 2. Construction du modèle architecture graphique
-        self.model = self.build_model().to(self.device)
 
-        # 3. Gestion du Run ID
+        # --- Run ID ---
         run_id = config.experiment.run_id
         if run_id is None:
             date = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
             run_id = f"{self.name}_{self.dataset_name}_{date}"
         self.run_id = run_id
 
-        # 4. Initialisation de l'Optimiseur via Réflexion Python
-        opt_type = config.optimizer.type
-        opt_params = config.optimizer.params
-        optimizer_cls = getattr(optim, opt_type)
-        self.optimizer = optimizer_cls(self.model.parameters(), lr=self.lr, **opt_params)
+        # --- Instantiation of PyTorch layers from the subclass ---
+        self._build_architecture()
 
-        # 5. Initialisation du Scheduler (Logique épurée)
-        self.scheduler = None
-        has_main_scheduler = config.scheduler.type is not None
-        has_warmup = config.training.warm_up_epochs > 0
+        # Move module to the device (CUDA / CPU)
+        self.to(self.device)
 
-        if has_warmup:
-            warm_up_epochs = config.training.warm_up_epochs
-            self.optimizer.param_groups[0]['lr'] = self.lr
-            
-            warmup_scheduler = LinearLR(
-                self.optimizer, start_factor=0.05, end_factor=1.0, total_iters=warm_up_epochs
-            )
-            
-            if has_main_scheduler:
-                sched_type = config.scheduler.type
-                sched_params = config.scheduler.params
-                scheduler_cls = getattr(optim.lr_scheduler, sched_type)
-                main_scheduler = scheduler_cls(self.optimizer, **sched_params)
-                
-                self.scheduler = SequentialLR(
-                    self.optimizer,
-                    schedulers=[warmup_scheduler, main_scheduler],
-                    milestones=[warm_up_epochs]
-                )
-            else:
-                self.scheduler = warmup_scheduler
-
-        elif has_main_scheduler:
-            sched_type = config.scheduler.type
-            sched_params = config.scheduler.params
-            scheduler_cls = getattr(optim.lr_scheduler, sched_type)
-            self.scheduler = scheduler_cls(self.optimizer, **sched_params)
-
-        # 6. Gestion des métriques et des checkpoints
-        self.metrics = config.metrics
-        self.checkpoint = CheckpointManager(
-            model=self.model, 
-            optimizer=self.optimizer, 
-            run_id=self.run_id, 
-            model_name=self.name, 
-            monitor_metric=config.metrics.monitor_metric
+        # --- Optimizer ---
+        optimizer_cls = getattr(optim, config.optimizer.type)
+        self.optimizer = optimizer_cls(
+            self.parameters(),
+            lr=self.lr,
+            **config.optimizer.params
         )
 
-        # 7. Initialisation du Trainer
-        self.trainer = Trainer(
-            model=self.model,
-            optimizer=self.optimizer,
-            device=self.device,
-            save=config.experiment.save_checkpoints,
-            checkpoint_fn=self.checkpoint.save,
-            scheduler=self.scheduler,
-            metrics=self.metrics,
-            num_classes=self.num_classes,
-            monitor_metric=config.metrics.monitor_metric,
-            monitor_mode=config.metrics.monitor_mode
-        )
+        # --- Scheduler (warm-up + main scheduler) ---
+        self.scheduler = self._build_scheduler(config)
 
-        self.predictor = Predictor(self.model, self.device)
+    # ------------------------------------------------------------------
+    # Abstract Interface
+    # ------------------------------------------------------------------
 
     @property
     @abstractmethod
     def name(self) -> str:
+        """Textual identifier of the model (e.g., 'SSD300_ResNet')."""
         pass
 
     @abstractmethod
-    def build_model(self) -> nn.Module:
+    def _build_architecture(self) -> None:
+        """
+        Abstract method called during initialization.
+        The subclass must instantiate its PyTorch sub-modules here
+        (e.g., self.resnet = ..., self.loc_layers = ..., self.criterion = ...).
+        """
         pass
 
-    def train(self, train_loader: DataLoader, val_loader: Optional[DataLoader] = None, epochs: int = 10) -> None:
-        self.trainer.train(train_loader, val_loader, epochs)
+    @abstractmethod
+    def forward(self, images, targets=None):
+        """
+        Forward pass of the PyTorch model.
+        In training mode (self.training=True): returns a dictionary of losses.
+        In evaluation mode (self.training=False): returns decoded predictions.
+        """
+        pass
 
-    def evaluate(self, val_loader: DataLoader) -> float:
-        return self.trainer.evaluate(val_loader)
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
 
-    def predict(self, images: List[torch.Tensor], confidence_threshold: float = 0.5) -> List[Dict[str, torch.Tensor]]:
-        return self.predictor.predict(images, confidence_threshold=confidence_threshold)
-    
-    def predict_on_loader(self, dataloader: DataLoader, confidence_threshold: float = 0.5) -> Tuple[List[Any], List[Any]]:
-        all_preds = []
-        all_targets = []
-        for images, targets in dataloader:
-            preds = self.predict(images, confidence_threshold=confidence_threshold)
-            all_preds.extend(preds)
-            all_targets.extend(targets)
-        return all_targets, all_preds
+    def _build_scheduler(self, config: Config) -> Optional[object]:
+        """Builds the scheduler from the configuration."""
+        has_warmup = config.training.warm_up_epochs > 0
+        has_main = config.scheduler.type is not None
 
-    def load_checkpoint(self, path: str, load_optimizer: bool = True) -> None:
-        # if not os.path.exists(path):
-        #     print(f"[WARNING] Checkpoint introuvable : {path}")
-        #     return
-        
-        # checkpoint = torch.load(path, map_location=self.device)
-        # self.model.load_state_dict(checkpoint["model_state_dict"])
-        
-        # if load_optimizer and "optimizer_state_dict" in checkpoint:
-        #     self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        
-        # if "epoch" in checkpoint:
-        #     self.trainer.start_epoch = checkpoint["epoch"]
-        # if "best_val_loss" in checkpoint:
-        #     self.trainer.best_val_loss = checkpoint["best_val_loss"]
-        
-        # print(f"[INFO] Checkpoint chargé depuis : {path}")
+        if not has_warmup and not has_main:
+            return None
 
-        success = self.checkpoint.load_latest(load_optimizer)
-        if success:
-            self.trainer.start_epoch = self.checkpoint.start_epoch
-            self.trainer.best_metric_value = self.checkpoint.monitor_metric_score
+        warmup_sched = None
+        if has_warmup:
+            warmup_sched = LinearLR(
+                self.optimizer,
+                start_factor=0.05,
+                end_factor=1.0,
+                total_iters=config.training.warm_up_epochs,
+            )
 
-    def save_checkpoint(self, epoch: int, val_loss: float) -> None:
-        save_dir = f"experiments/{self.run_id}"
-        os.makedirs(save_dir, exist_ok=True)
-        path = os.path.join(save_dir, "best_model.pth")
-        
-        torch.save({
-            "epoch": epoch,
-            "model_state_dict": self.model.state_dict(),
-            "optimizer_state_dict": self.optimizer.state_dict(),
-            "best_val_loss": val_loss,
-        }, path)
-        print(f"[INFO] Checkpoint sauvegardé : {path}")
+        main_sched = None
+        if has_main:
+            scheduler_cls = getattr(optim.lr_scheduler, config.scheduler.type)
+            main_sched = scheduler_cls(self.optimizer, **config.scheduler.params)
 
-    def save_hyperparams(self) -> None:
-        """ Sauvegarde la configuration sous forme de JSON structuré et lisible """
-        final_best_metrics = self.trainer.get_final_metrics()
+        if warmup_sched and main_sched:
+            return SequentialLR(
+                self.optimizer,
+                schedulers=[warmup_sched, main_sched],
+                milestones=[config.training.warm_up_epochs],
+            )
 
+        return warmup_sched or main_sched
+
+    def save_hyperparams(self, extra_results: Optional[Dict] = None) -> None:
+        """
+        Saves the complete configuration and final results in
+        experiments/<run_id>/meta.json.
+        """
         meta = asdict(self.config)
-
-        metrics = meta["metrics"]
-        configs = metrics.pop("configs", {})
-        meta["metrics"].update({
-            name: tuple(value)
-            for name, value in configs.items()
-        })
-
         meta["experiment"]["run_id"] = self.run_id
-        
-        meta["results"] = {
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "best_validation_results": final_best_metrics
-        }
 
-        path = os.path.join(f"experiments/{self.run_id}", "meta.json")
+        if extra_results is not None:
+            meta["results"] = {
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "best_validation_results": extra_results,
+            }
+
+        path = os.path.join("experiments", self.run_id, "meta.json")
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        
         with open(path, "w", encoding="utf-8") as f:
             json.dump(meta, f, indent=4, ensure_ascii=False)
-            
-        print(f"[INFO] Métriques et configuration sauvegardées dans : {path}")
+
+        print(f"[INFO] Configuration saved: {path}")

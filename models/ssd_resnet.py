@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchvision.ops import batched_nms
-from typing import List, Dict
+from typing import List, Dict, Optional
 
 from core.config import Config
 from core.model_base import Model
@@ -12,22 +12,19 @@ from utils.ssd_utils import generate_ssd_priors
 
 class Bottleneck(nn.Module):
     """
-    Bloc Bottleneck standard de ResNet (1x1 conv -> 3x3 conv -> 1x1 conv)
-    L'expansion est de 4 (ex: 64 canaux d'entrée -> 256 canaux de sortie).
+    Standard ResNet Bottleneck block (1x1 conv -> 3x3 conv -> 1x1 conv).
+    Expansion factor is 4 (e.g. 64 input channels -> 256 output channels).
     """
     expansion: int = 4
 
-    def __init__(self, in_planes: int, planes: int, stride: int = 1, downsample: nn.Module = None):
+    def __init__(self, in_planes: int, planes: int, stride: int = 1, downsample: Optional[nn.Module] = None):
         super().__init__()
-        # 1x1 Conv : Réduction du nombre de canaux
         self.conv1 = nn.Conv2d(in_planes, planes, kernel_size=1, bias=False)
         self.bn1 = nn.BatchNorm2d(planes)
 
-        # 3x3 Conv : Extraction spatiale
         self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=stride, padding=1, bias=False)
         self.bn2 = nn.BatchNorm2d(planes)
 
-        # 1x1 Conv : Restauration/Expansion des canaux (planes * 4)
         self.conv3 = nn.Conv2d(planes, planes * self.expansion, kernel_size=1, bias=False)
         self.bn3 = nn.BatchNorm2d(planes * self.expansion)
 
@@ -48,7 +45,7 @@ class Bottleneck(nn.Module):
         out = self.conv3(out)
         out = self.bn3(out)
 
-        # Si le stride > 1 ou si le nombre de canaux change, ajuster l'identité
+        # If stride > 1 or channel count changes, adjust identity
         if self.downsample is not None:
             identity = self.downsample(x)
 
@@ -58,36 +55,28 @@ class Bottleneck(nn.Module):
 
 
 class ResNetBackbone(nn.Module):
-    """ Backbone ResNet construit manuellement """
+    """ Custom-built ResNet backbone """
     def __init__(self):
         super().__init__()
         self.in_planes = 64
 
-        # --- Stem Inicial ---
-        # Image (3, 300, 300) -> Conv7x7 -> (64, 150, 150) -> MaxPool -> (64, 75, 75)
+        # Initial Stem: Image (3, 300, 300) -> Conv7x7 -> (64, 150, 150) -> MaxPool -> (64, 75, 75)
         self.conv1 = nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False)
         self.bn1 = nn.BatchNorm2d(64)
         self.relu = nn.ReLU(inplace=True)
         self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
 
-        # --- ResNet Layers ---
-        # Layer 1 : 3 blocs (Sortie: 256 canaux, 75x75)
+        # ResNet Layers
         self.layer1 = self._make_layer(Bottleneck, planes=64, blocks=2, stride=1)
-        
-        # Layer 2 : 4 blocs (Sortie: 512 canaux, 38x38) -> SOURCE SSD 1
         self.layer2 = self._make_layer(Bottleneck, planes=128, blocks=2, stride=2)
-        
-        # Layer 3 : 6 blocs (Sortie: 1024 canaux, 19x19) -> SOURCE SSD 2
         self.layer3 = self._make_layer(Bottleneck, planes=256, blocks=2, stride=2)
-        
-        # Layer 4 : 3 blocs (Sortie: 2048 canaux, 10x10) -> SOURCE SSD 3
         self.layer4 = self._make_layer(Bottleneck, planes=512, blocks=2, stride=2)
 
         self._init_weights()
 
     def _make_layer(self, block, planes: int, blocks: int, stride: int = 1) -> nn.Sequential:
         downsample = None
-        # Création du chemin de projection si résolution réduite ou canaux modifiés
+        # Create projection shortcut if spatial size is reduced or channels change
         if stride != 1 or self.in_planes != planes * block.expansion:
             downsample = nn.Sequential(
                 nn.Conv2d(self.in_planes, planes * block.expansion, kernel_size=1, stride=stride, bias=False),
@@ -95,18 +84,18 @@ class ResNetBackbone(nn.Module):
             )
 
         layers = []
-        # Premier bloc du groupe (peut réduire la taille spatiale via stride)
+        # First block in group (may reduce spatial size via stride)
         layers.append(block(self.in_planes, planes, stride, downsample))
         self.in_planes = planes * block.expansion
 
-        # Blocs suivants du même groupe (stride 1)
+        # Subsequent blocks in same group (stride 1)
         for _ in range(1, blocks):
             layers.append(block(self.in_planes, planes))
 
         return nn.Sequential(*layers)
 
     def _init_weights(self):
-        """ Initialisation Kaiming Normal pour les Conv2d """
+        """ Kaiming Normal initialization for Conv2d """
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
@@ -115,35 +104,48 @@ class ResNetBackbone(nn.Module):
                 nn.init.constant_(m.bias, 0)
 
 
-# =====================================================================
-# 3. SSD DETECTOR INTEGRATING RESNET
-# =====================================================================
+class SSDResNetModel(Model):
+    """
+    SSD300 detector built on a ResNet backbone.
+    Inherits directly from Model.
+    """
 
-class SSDResNetBackbone(nn.Module):
-    def __init__(self, num_classes: int):
-        super().__init__()
-        self.num_classes = num_classes
+    def __init__(
+        self,
+        config: Config,
+        score_thresh: float = 0.15,
+        iou_thresh: float = 0.45,
+        device: Optional[str] = None,
+        **kwargs
+    ):
+        self.score_thresh = score_thresh
+        self.iou_thresh = iou_thresh
+        super().__init__(config=config, device=device)
+
+    @property
+    def name(self) -> str:
+        return "SSD300_ResNet"
+
+    def _build_architecture(self) -> None:
+        """ Instantiates PyTorch submodules for SSD-ResNet """
         self.register_buffer("priors", generate_ssd_priors())
 
-        # Instanciation de notre ResNet Fait Maison
+        # ResNet Backbone
         self.resnet = ResNetBackbone()
 
-        # Couches Supplémentaires SSD (Sources 4, 5 et 6)
-        # Source 4 : 10x10 -> 5x5
+        # Extra SSD Layers (Sources 4, 5 and 6)
         self.extra_conv1 = nn.Sequential(
             nn.Conv2d(2048, 256, kernel_size=1),
             nn.ReLU(inplace=True),
             nn.Conv2d(256, 512, kernel_size=3, stride=2, padding=1),
             nn.ReLU(inplace=True)
         )
-        # Source 5 : 5x5 -> 3x3
         self.extra_conv2 = nn.Sequential(
             nn.Conv2d(512, 128, kernel_size=1),
             nn.ReLU(inplace=True),
             nn.Conv2d(128, 256, kernel_size=3, stride=1, padding=0),
             nn.ReLU(inplace=True)
         )
-        # Source 6 : 3x3 -> 1x1
         self.extra_conv3 = nn.Sequential(
             nn.Conv2d(256, 128, kernel_size=1),
             nn.ReLU(inplace=True),
@@ -151,7 +153,7 @@ class SSDResNetBackbone(nn.Module):
             nn.ReLU(inplace=True)
         )
 
-        # Têtes MultiBox (Localisation & Classification)
+        # MultiBox Heads (Localization & Classification)
         num_boxes = [4, 6, 6, 6, 4, 4]
         in_channels = [512, 1024, 2048, 512, 256, 256]
 
@@ -161,11 +163,11 @@ class SSDResNetBackbone(nn.Module):
         ])
 
         self.cls_layers = nn.ModuleList([
-            nn.Conv2d(in_ch, n_box * num_classes, kernel_size=3, padding=1)
+            nn.Conv2d(in_ch, n_box * self.num_classes, kernel_size=3, padding=1)
             for in_ch, n_box in zip(in_channels, num_boxes)
         ])
 
-        self.criterion = SSDMultiBoxLoss(num_classes=num_classes)
+        self.criterion = SSDMultiBoxLoss(num_classes=self.num_classes)
 
     def forward(self, images, targets=None):
         if isinstance(images, list):
@@ -176,39 +178,43 @@ class SSDResNetBackbone(nn.Module):
         if self.training and targets is not None:
             return self.criterion(loc_preds, cls_preds, targets, self.priors)
 
-        return self.predict_decoded(loc_preds, cls_preds)
+        return self.predict_decoded(
+            loc_preds, cls_preds,
+            confidence_threshold=self.score_thresh,
+            iou_threshold=self.iou_thresh
+        )
 
     def compute_raw_predictions(self, x: torch.Tensor):
         sources = []
 
-        # Stream principal ResNet
+        # Main ResNet stream
         x = self.resnet.conv1(x)
         x = self.resnet.bn1(x)
         x = self.resnet.relu(x)
         x = self.resnet.maxpool(x)
 
         x = self.resnet.layer1(x)
-        
+
         x = self.resnet.layer2(x)
-        sources.append(x)  # Source 1 : 38x38 (512 ch)
+        sources.append(x)  # Source 1: 38x38 (512 ch)
 
         x = self.resnet.layer3(x)
-        sources.append(x)  # Source 2 : 19x19 (1024 ch)
+        sources.append(x)  # Source 2: 19x19 (1024 ch)
 
         x = self.resnet.layer4(x)
-        sources.append(x)  # Source 3 : 10x10 (2048 ch)
+        sources.append(x)  # Source 3: 10x10 (2048 ch)
 
-        # Layers supplémentaires SSD
+        # Extra SSD layers
         x = self.extra_conv1(x)
-        sources.append(x)  # Source 4 : 5x5 (512 ch)
+        sources.append(x)  # Source 4: 5x5 (512 ch)
 
         x = self.extra_conv2(x)
-        sources.append(x)  # Source 5 : 3x3 (256 ch)
+        sources.append(x)  # Source 5: 3x3 (256 ch)
 
         x = self.extra_conv3(x)
-        sources.append(x)  # Source 6 : 1x1 (256 ch)
+        sources.append(x)  # Source 6: 1x1 (256 ch)
 
-        # Pass passage dans les têtes MultiBox
+        # Pass through MultiBox heads
         loc_outputs, cls_outputs = [], []
         for (feat, l_conv, c_conv) in zip(sources, self.loc_layers, self.cls_layers):
             loc_outputs.append(l_conv(feat).permute(0, 2, 3, 1).contiguous().view(feat.size(0), -1))
@@ -222,15 +228,22 @@ class SSDResNetBackbone(nn.Module):
 
         return loc_final, cls_final
 
-    def predict_decoded(self, loc_preds: torch.Tensor, cls_preds: torch.Tensor, confidence_threshold: float = 0.15, iou_threshold: float = 0.45, img_size=(300, 300)) -> List[Dict[str, torch.Tensor]]:
+    def predict_decoded(
+        self,
+        loc_preds: torch.Tensor,
+        cls_preds: torch.Tensor,
+        confidence_threshold: float = 0.15,
+        iou_threshold: float = 0.45,
+        img_size=(300, 300)
+    ) -> List[Dict[str, torch.Tensor]]:
         B = loc_preds.size(0)
         img_w, img_h = img_size
         device = loc_preds.device
 
         cx = loc_preds[..., 0] * 0.1 * self.priors[:, 2] + self.priors[:, 0]
         cy = loc_preds[..., 1] * 0.1 * self.priors[:, 3] + self.priors[:, 1]
-        w  = torch.exp(loc_preds[..., 2] * 0.2) * self.priors[:, 2]
-        h  = torch.exp(loc_preds[..., 3] * 0.2) * self.priors[:, 3]
+        w = torch.exp(loc_preds[..., 2] * 0.2) * self.priors[:, 2]
+        h = torch.exp(loc_preds[..., 3] * 0.2) * self.priors[:, 3]
 
         decoded_boxes = torch.zeros_like(loc_preds)
         decoded_boxes[..., 0] = (cx - w / 2.0) * img_w
@@ -276,22 +289,6 @@ class SSDResNetBackbone(nn.Module):
                 })
 
         return predictions_list
-
-
-class SSDResNetModel(Model):
-    """ Modèle SSD-ResNet50 """
-    def __init__(self, config: Config, score_thresh: float = 0.15, iou_thresh: float = 0.45, **kwargs):
-        self.score_thresh = score_thresh
-        self.iou_thresh = iou_thresh
-        super().__init__(config=config, **kwargs)
-
-    @property
-    def name(self) -> str:
-        return "SSD300_ResNet"
-
-    def build_model(self) -> nn.Module:
-        print("[INFO] Building SSD300 with ResNet")
-        return SSDResNetBackbone(num_classes=self.num_classes)
 
     def get_model_specific_params(self) -> dict:
         return {

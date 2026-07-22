@@ -1,251 +1,256 @@
-import numpy as np
 import torch
 from torch import nn, optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from typing import Callable, Optional, List, Dict, Any
+from typing import Callable, Optional, List, Dict
 
 import core.metrics as core_metrics
 from core.metrics import compute_dataset_tp_fp
 
+
 class Trainer:
     """
-    Classe pour entraîner un modèle de détection d'objets (ex: Faster R-CNN, SSD, YOLO).
-    
-    Attributes:
-        model (nn.Module): Modèle de détection à entraîner
-        optimizer (torch.optim.Optimizer): Optimiseur
-        device (str): Équipement cible ('cuda' ou 'cpu')
-        save (bool): Sauvegarder ou non le meilleur modèle
-        save_checkpoint (function): Fonction externe de sauvegarde
-        scheduler (LRScheduler): Gestionnaire de Learning Rate
-        num_classes (int): Nombre de classes du dataset
+    Trains an object detection model and evaluates its metrics.
+
+    Args:
+        model (nn.Module): PyTorch network to train.
+        optimizer (Optimizer): Associated optimizer.
+        device (str): 'cuda' or 'cpu'.
+        scheduler (LRScheduler, optional): Learning rate scheduler.
+        num_classes (int): Total number of classes (including background).
+        metrics_config (MetricsConfig, optional): Metrics configuration (from Config.metrics).
+        on_best_model (callable, optional): Callback triggered when a new best model is found.
+                                            Signature: fn(epoch: int, metric_value: float)
+                                            Typically: checkpoint.save
     """
-    
+
     def __init__(
         self,
         model: nn.Module,
         optimizer: torch.optim.Optimizer,
         device: str,
-        save: bool = False,
-        checkpoint_fn: Optional[Callable[[int, float], None]] = None,
         scheduler: Optional[optim.lr_scheduler.LRScheduler] = None,
-        metrics: Optional[dict] = None,
         num_classes: Optional[int] = None,
-        monitor_metric: str = "mAP",
-        monitor_mode: str = "max"
+        metrics_config = None,  # MetricsConfig | None
+        on_best_model: Optional[Callable[[int, float], None]] = None,
     ) -> None:
-        
+
         self.model = model
         self.optimizer = optimizer
         self.device = device
-        self.save = save
-        self.save_checkpoint = checkpoint_fn
         self.scheduler = scheduler
         self.num_classes = num_classes
+        self.metrics_config = metrics_config
+        self.on_best_model = on_best_model
 
-        self.monitor_metric = monitor_metric
-        self.monitor_mode = monitor_mode.lower()
-        assert self.monitor_mode in ["max", "min"], "monitor_mode doit être 'max' ou 'min'"
+        # Best metric tracking parameters
+        if metrics_config is not None:
+            self.monitor_metric = metrics_config.monitor_metric
+            self.monitor_mode = metrics_config.monitor_mode.lower()
+        else:
+            self.monitor_metric = "val_loss"
+            self.monitor_mode = "min"
 
-        # Suivi des pertes moyennes par époque
-        self.train_loss = []
-        self.valid_loss = []
-        self.lr_history = []
+        assert self.monitor_mode in ("max", "min"), \
+            "monitor_mode must be 'max' or 'min'"
 
-        self.best_metric_value = float('-inf') if self.monitor_mode == "max" else float('inf')
-        self.best_val_loss = float('inf')
+        # History logs
+        self.train_loss: List[float] = []
+        self.valid_loss: List[float] = []
+        self.lr_history: List[float] = []
+        self.valid_metrics: Dict[str, List[float]] = {}
+
+        # Internal state
         self.start_epoch = 0
+        self.best_metric_value = float("-inf") if self.monitor_mode == "max" else float("inf")
         self.best_epoch_metrics: dict = {}
 
-        # Initialisation des métriques (ex: IoU, mAP, F1-score)
-        self.metrics = metrics if metrics else {}
-        self.valid_metrics: Dict[str, list] = {}
+    # ------------------------------------------------------------------
+    # Training loop
+    # ------------------------------------------------------------------
 
-    def train(self, train_loader: DataLoader, val_loader: Optional[DataLoader] = None, epochs: int = 10) -> None:
-        """ Boucle principale d'entraînement """
+    def train(
+        self,
+        train_loader: DataLoader,
+        val_loader: Optional[DataLoader] = None,
+        epochs: int = 10,
+    ) -> None:
+        """Main training loop."""
+
         for epoch in range(self.start_epoch, epochs):
 
-            current_lr = self.optimizer.param_groups[0]['lr']
+            current_lr = self.optimizer.param_groups[0]["lr"]
             self.lr_history.append(current_lr)
-            
-            # Mode d'entraînement indispensable pour que le modèle calcule les pertes (Losses)
+
             self.model.train()
-            
             running_loss = 0.0
 
-            # Utilisation de tqdm pour la barre de progression
-            pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}")
+            pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{epochs}")
             for images, targets in pbar:
-                
-                # Correction robuste : images est une liste/tuple de tenseurs. On envoie chaque image individuellement.
-                images_device = list(img.to(self.device, non_blocking=True) for img in images)
+                images_device = [img.to(self.device, non_blocking=True) for img in images]
                 targets_device = [{k: v.to(self.device, non_blocking=True) for k, v in t.items()} for t in targets]
 
                 self.optimizer.zero_grad()
-                
-                # Le modèle renvoie un dictionnaire de pertes : loss_classifier, loss_box_reg, etc.
                 loss_dict = self.model(images_device, targets_device)
-                
-                # Somme de toutes les pertes du dictionnaire
-                losses = sum(loss for loss in loss_dict.values())
-                
+                losses = sum(loss_dict.values())
                 losses.backward()
                 self.optimizer.step()
 
                 running_loss += losses.item()
                 pbar.set_postfix({"batch_loss": f"{losses.item():.4f}"})
 
-            # Calcul de la perte moyenne de l'époque
             epoch_train_loss = running_loss / len(train_loader)
             self.train_loss.append(epoch_train_loss)
+            print(f"{'Train':<12} | Loss: {epoch_train_loss:.4f} | LR: {current_lr:.2e}")
 
-            print(f"{'Train':<12} | Avg Loss: {epoch_train_loss:.4f} | Learning Rate: {current_lr:.6f}")
-
-            # Évaluation et calcul des métriques globales de validation
-            if val_loader:
+            # --- Validation ---
+            if val_loader is not None:
                 val_loss, val_metrics = self.evaluate(val_loader)
+                self._maybe_save_best(epoch, val_loss, val_metrics)
 
-                if self.monitor_metric in ["loss", "val_loss"]:
-                    current_metric_val = val_loss
-                else:
-                    # Valeur par défaut logique en cas d'absence de la clé
-                    default_val = float('-inf') if self.monitor_mode == "max" else float('inf')
-                    current_metric_val = val_metrics.get(self.monitor_metric, default_val)
-
-                is_better = False
-                if self.monitor_mode == "max" and current_metric_val > self.best_metric_value:
-                    is_better = True
-                elif self.monitor_mode == "min" and current_metric_val < self.best_metric_value:
-                    is_better = True
-
-                # Sauvegarde du meilleur modèle basé sur la métrique choisie
-                if self.save and is_better:
-                    self.best_metric_value = current_metric_val
-                    self.best_val_loss = val_loss
-
-                    self.best_epoch_metrics = {
-                        "epoch": epoch + 1,
-                        "train_loss": epoch_train_loss,
-                        "val_loss": val_loss,
-                        "val_metrics": val_metrics,
-                        "monitor_metric": self.monitor_metric,
-                        "monitor_value": current_metric_val,
-                        # "valid_metrics": {name: self.valid_metrics[name][-1] for name in self.valid_metrics.keys()} if self.valid_metrics else {}
-                    }
-                    if self.save_checkpoint:
-                        self.save_checkpoint(epoch + 1, current_metric_val)
-            
             if self.scheduler is not None:
                 self.scheduler.step()
 
             print()
 
-    def evaluate(self, data_loader: DataLoader) -> float:
+    # ------------------------------------------------------------------
+    # Evaluation
+    # ------------------------------------------------------------------
+
+    def evaluate(self, data_loader: DataLoader):
         """
-        Évalue le modèle. 
-        Crucial en détection : pour obtenir la perte de validation, le modèle DOIT rester 
-        techniquement en mode `.train()` mais enveloppé dans un `torch.no_grad()`.
+        Computes validation loss and object detection metrics.
+
+        The model remains in `.train()` mode to compute losses
+        (torchvision behavior), but gradients are disabled.
+        A second pass in `.eval()` provides decoded predictions for evaluation metrics.
+
+        Returns:
+            (val_loss: float, metric_outputs: dict)
         """
-        # On reste en mode train pour forcer le calcul des pertes sans modifier les poids
-        self.model.train() 
-        
+        self.model.train()
         running_loss = 0.0
-        all_preds = []
-        all_targets = []
+        all_preds: List[dict] = []
+        all_targets: List[dict] = []
 
         with torch.no_grad():
             for images, targets in data_loader:
-                # Conversion robuste des listes d'images
-                images_device = list(img.to(self.device, non_blocking=True) for img in images)
+                images_device = [img.to(self.device, non_blocking=True) for img in images]
                 targets_device = [{k: v.to(self.device, non_blocking=True) for k, v in t.items()} for t in targets]
-                
-                # Récupération des pertes de validation
-                loss_dict = self.model(images_device, targets_device)
-                losses = sum(loss for loss in loss_dict.values())
-                running_loss += losses.item()
 
-                # Pour les métriques de détection (mAP, IoU, F1), il faut les prédictions réelles.
-                if self.metrics:
+                loss_dict = self.model(images_device, targets_device)
+                running_loss += sum(loss_dict.values()).item()
+
+                if self.metrics_config is not None:
                     self.model.eval()
-                    # Gestion robuste si le modèle possède une fonction predict custom (ex: notre YOLOModel)
                     if hasattr(self.model, "predict"):
                         preds = self.model.predict(images_device, confidence_threshold=0.15)
                     else:
                         preds = self.model(images_device)
-                        
-                    self.model.train() # Rebasculer immédiatement en train
-                    
-                    # Stockage sur le CPU pour préserver la VRAM du GPU
+                    self.model.train()
+
                     all_preds.extend([{k: v.cpu() for k, v in p.items()} for p in preds])
                     all_targets.extend([{k: v.cpu() for k, v in t.items()} for t in targets])
 
-        epoch_val_loss = running_loss / len(data_loader)
-        self.valid_loss.append(epoch_val_loss)
+        val_loss = running_loss / len(data_loader)
+        self.valid_loss.append(val_loss)
 
-        # Calcul des métriques de détection (mAP / F1-Score / Precision / Recall)
+        # --- Metrics ---
+        metric_outputs: dict = {}
         metrics_str = ""
-        if self.metrics:
+        if self.metrics_config is not None and all_preds:
             metric_outputs = self._compute_metrics(all_targets, all_preds)
             for name, value in metric_outputs.items():
-                # Initialisation dynamique des clés de métriques si elles n'existent pas
-                if name not in self.valid_metrics:
-                    self.valid_metrics[name] = []
-                self.valid_metrics[name].append(value)
-                
-            metrics_str = " | " + " | ".join(f"{name}: {value:.4f}" for name, value in metric_outputs.items())
+                self.valid_metrics.setdefault(name, []).append(value)
+            metrics_str = " | " + " | ".join(f"{n}: {v:.4f}" for n, v in metric_outputs.items())
 
-        print(f"{'Validation':<12} | Avg Loss: {epoch_val_loss:.4f}{metrics_str}")
-        
-        return epoch_val_loss, metric_outputs
+        print(f"{'Validation':<12} | Loss: {val_loss:.4f}{metrics_str}")
+        return val_loss, metric_outputs
 
+    # ------------------------------------------------------------------
+    # Internal
+    # ------------------------------------------------------------------
 
-    def _compute_metrics(self, targets: List[Dict[str, torch.Tensor]], predictions: List[Dict[str, torch.Tensor]]) -> Dict[str, float]:
+    def _compute_metrics(
+        self,
+        targets: List[Dict[str, torch.Tensor]],
+        predictions: List[Dict[str, torch.Tensor]],
+    ) -> Dict[str, float]:
         """
-        Calcule les métriques en extrayant les TP/FP une seule fois 
-        et en les injectant dans les fonctions cibles.
+        Computes all configured metrics reusing a single TP/FP pass.
         """
-        metric_outputs = {}
-        
-        # 1. Calcul UNIQUE du matching géométrique pour tout le lot/dataset
-        # On utilise le IoU threshold global de votre configuration (ex: 0.5)
-        iou_threshold = getattr(self.metrics, "params", {}).get("iou_threshold", 0.5)
-        
-        # Cette fonction noyau extrait tout le dictionnaire de données (cls_tp, cls_fp, etc.)
+        iou_threshold = 0.5  # Default value
+        # Try retrieving the threshold from the first found config
+        for _, params in self.metrics_config.configs.values():
+            if "iou_threshold" in params:
+                iou_threshold = params["iou_threshold"]
+                break
+
         raw_data = compute_dataset_tp_fp(
-            predictions=predictions, 
-            targets=targets, 
-            num_classes=self.num_classes, 
-            iou_threshold=iou_threshold
+            predictions=predictions,
+            targets=targets,
+            num_classes=self.num_classes,
+            iou_threshold=iou_threshold,
         )
-        
-        # 2. Distribution des TP/FP pré-calculés aux fonctions de métriques
-        for name, (func, params) in self.metrics.configs.items():
-            # ✨ CORRECTION : Si func est une chaîne, on récupère dynamiquement la vraie fonction
-            if isinstance(func, str):
-                if hasattr(core_metrics, func):
-                    func = getattr(core_metrics, func)
-                else:
-                    raise AttributeError(f"La fonction '{func}' est introuvable dans core.metrics")
 
-            # On fusionne les paramètres
-            full_kwargs = {
-                **raw_data, 
-                "num_classes": self.num_classes,
-                **params
-            }
-            
-            # Appel de la fonction avec le dictionnaire de paramètres complet
-            score = func(**full_kwargs)
-            
-            # Déballage standard des résultats
+        metric_outputs: dict = {}
+        for name, (func, params) in self.metrics_config.configs.items():
+            # Dynamic resolution if func is a string
+            if isinstance(func, str):
+                if not hasattr(core_metrics, func):
+                    raise AttributeError(f"Function '{func}' not found in core.metrics")
+                func = getattr(core_metrics, func)
+
+            score = func(**raw_data, num_classes=self.num_classes, **params)
+
             if isinstance(score, dict):
-                for k, v in score.items():
-                    metric_outputs[k] = v
+                metric_outputs.update(score)
             else:
                 metric_outputs[name] = score
-                
+
         return metric_outputs
-    
+
+    def _is_better(self, value: float) -> bool:
+        if self.monitor_mode == "max":
+            return value > self.best_metric_value
+        return value < self.best_metric_value
+
+    def _maybe_save_best(self, epoch: int, val_loss: float, val_metrics: dict) -> None:
+        """Decides whether to save and updates best_epoch_metrics."""
+        if self.monitor_metric in ("loss", "val_loss"):
+            current_value = val_loss
+        else:
+            default = float("-inf") if self.monitor_mode == "max" else float("inf")
+            current_value = val_metrics.get(self.monitor_metric, default)
+
+        if self._is_better(current_value):
+            self.best_metric_value = current_value
+            self.best_epoch_metrics = {
+                "epoch": epoch + 1,
+                "train_loss": self.train_loss[-1],
+                "val_loss": val_loss,
+                "val_metrics": val_metrics,
+                "monitor_metric": self.monitor_metric,
+                "monitor_value": current_value,
+            }
+            if self.on_best_model is not None:
+                self.on_best_model(epoch + 1, current_value)
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
     def get_final_metrics(self) -> dict:
+        """Returns metrics from the best epoch."""
         return self.best_epoch_metrics
+
+    def resume_from(self, epoch: int, best_metric_value: float) -> None:
+        """
+        Restores Trainer internal state after loading a checkpoint.
+
+        Args:
+            epoch: Epoch to resume from (= epoch_saved + 1).
+            best_metric_value: Best known metric value prior to resuming.
+        """
+        self.start_epoch = epoch
+        self.best_metric_value = best_metric_value
