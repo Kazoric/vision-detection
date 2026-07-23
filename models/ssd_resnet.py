@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchvision.ops import batched_nms
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 
 from core.config import Config
 from core.model_base import Model
@@ -83,9 +83,7 @@ class ResNetBackbone(nn.Module):
                 nn.BatchNorm2d(planes * block.expansion)
             )
 
-        layers = []
-        # First block in group (may reduce spatial size via stride)
-        layers.append(block(self.in_planes, planes, stride, downsample))
+        layers = [block(self.in_planes, planes, stride, downsample)]
         self.in_planes = planes * block.expansion
 
         # Subsequent blocks in same group (stride 1)
@@ -102,6 +100,14 @@ class ResNetBackbone(nn.Module):
             elif isinstance(m, nn.BatchNorm2d):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            x = self.maxpool(self.relu(self.bn1(self.conv1(x))))
+            x = self.layer1(x)
+            c3 = self.layer2(x)  # Échelle 1/8
+            c4 = self.layer3(c3) # Échelle 1/16
+            c5 = self.layer4(c4) # Échelle 1/32
+            return c3, c4, c5
 
 
 class SSDResNetModel(Model):
@@ -188,24 +194,27 @@ class SSDResNetModel(Model):
         sources = []
 
         # Main ResNet stream
-        x = self.resnet.conv1(x)
-        x = self.resnet.bn1(x)
-        x = self.resnet.relu(x)
-        x = self.resnet.maxpool(x)
+        # x = self.resnet.conv1(x)
+        # x = self.resnet.bn1(x)
+        # x = self.resnet.relu(x)
+        # x = self.resnet.maxpool(x)
 
-        x = self.resnet.layer1(x)
+        # x = self.resnet.layer1(x)
 
-        x = self.resnet.layer2(x)
-        sources.append(x)  # Source 1: 38x38 (512 ch)
+        # x = self.resnet.layer2(x)
+        # sources.append(x)  # Source 1: 38x38 (512 ch)
 
-        x = self.resnet.layer3(x)
-        sources.append(x)  # Source 2: 19x19 (1024 ch)
+        # x = self.resnet.layer3(x)
+        # sources.append(x)  # Source 2: 19x19 (1024 ch)
 
-        x = self.resnet.layer4(x)
-        sources.append(x)  # Source 3: 10x10 (2048 ch)
+        # x = self.resnet.layer4(x)
+        # sources.append(x)  # Source 3: 10x10 (2048 ch)
+
+        c3, c4, c5 = self.resnet(x)
+        sources.extend([c3, c4, c5])
 
         # Extra SSD layers
-        x = self.extra_conv1(x)
+        x = self.extra_conv1(c5)
         sources.append(x)  # Source 4: 5x5 (512 ch)
 
         x = self.extra_conv2(x)
