@@ -11,6 +11,26 @@ class ExperimentConfig:
 class ModelConfig:
     name: str
     num_classes: int
+    score_thresh: float = 0.25
+    iou_thresh: float = 0.45
+    # Dictionnaires de configuration pour la fabrique (build) des sous-modules
+    backbone: Dict[str, Any] = field(default_factory=dict)
+    neck: Optional[Dict[str, Any]] = None
+    head: Optional[Dict[str, Any]] = None
+    strides: List[int] = field(default_factory=lambda: [8, 16, 32])  # P3=8, P4=16, P5=32
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "ModelConfig":
+        return cls(
+            name=d["name"],
+            num_classes=d["num_classes"],
+            score_thresh=d.get("score_thresh", 0.25),
+            iou_thresh=d.get("iou_thresh", 0.45),
+            backbone=d.get("backbone", {}),
+            neck=d.get("neck"),
+            head=d.get("head"),
+            strides=d.get("strides", [8, 16, 32]),
+        )
 
 @dataclass
 class TrainingConfig:
@@ -57,7 +77,7 @@ class Config:
         
         return cls(
             experiment=ExperimentConfig(**d["experiment"]),
-            model=ModelConfig(**d["model"]),
+            model=ModelConfig.from_dict(d["model"]),
             training=TrainingConfig(**d["training"]),
             optimizer=OptimizerConfig(**d["optimizer"]),
             scheduler=SchedulerConfig(**d.get("scheduler", {"type": None, "params": {}})),

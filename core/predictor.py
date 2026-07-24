@@ -37,8 +37,12 @@ class Predictor:
         """
         self.model.eval()
         with torch.no_grad():
-            inputs_device = [img.to(self.device, non_blocking=True) for img in inputs]
-            raw_outputs = self.model(inputs_device)
+            if isinstance(inputs, list):
+                inputs_device = torch.stack([img.to(self.device) for img in inputs])
+            else:
+                inputs_device = inputs.to(self.device)
+            # raw_outputs = self.model(inputs_device)
+            raw_outputs = self.model.predict(inputs_device, confidence_threshold=confidence_threshold)
 
         results = []
         for i, output in enumerate(raw_outputs):
