@@ -140,7 +140,7 @@ def get_transforms(image_size: Tuple[int, int], mean: Optional[List[float]], std
         transforms.Resize(image_size),
         transforms.ColorJitter(brightness=0.5, contrast=0.3, saturation=0.3, hue=0.3),
         # transforms.RandomHorizontalFlip(p=0.5),
-        # transforms.RandomRotation(degrees=(0, 180)),
+        # transforms.RandomRotation(15),
         # transforms.RandomResizedCrop(image_size, scale=(0.5, 1.0)),
         transforms.ToTensor(),
         transforms.Normalize(mean, std),

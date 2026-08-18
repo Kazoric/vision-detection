@@ -35,18 +35,46 @@ class SSDDetector(BaseDetector):
         neck: nn.Module,
         head: nn.Module,
         num_classes: int = 10,
+        image_size: Tuple[int, int] = [300, 300],
         score_thresh: float = 0.15,
         iou_thresh: float = 0.45,
         criterion: Optional[nn.Module] = None,
     ):
         super().__init__(backbone=backbone, neck=neck, head=head)
         self.num_classes = num_classes
+        self.image_size = image_size
         self.score_thresh = score_thresh
         self.iou_thresh = iou_thresh
         # self.criterion = criterion  # Module de perte (ex: MultiBoxLoss)
         self.criterion = SSDMultiBoxLoss(num_classes=self.num_classes)
 
-        self.register_buffer("priors", generate_ssd_priors())
+        feature_map_sizes = self._infer_feature_map_sizes(self.image_size)
+
+        # 2. Génération automatique des priors adaptés aux feature maps
+        priors = generate_ssd_priors(
+            feature_map_sizes=feature_map_sizes,
+            image_size=self.image_size,
+        )
+
+        self.register_buffer("priors", priors)
+
+    def _infer_feature_map_sizes(self, image_size: Tuple[int, int]) -> List[Tuple[int, int]]:
+        """ Effectue un 'dummy forward' pour déterminer dynamiquement (H, W) de chaque sortie. """
+        self.eval()
+        with torch.no_grad():
+            dummy = torch.zeros(1, 3, image_size[0], image_size[1])
+            feats = self.backbone(dummy)
+            if self.neck is not None:
+                feats = self.neck(feats)
+
+            if isinstance(feats, dict):
+                feature_maps = [f.shape[2:] for f in feats.values()]
+            elif isinstance(feats, (list, tuple)):
+                feature_maps = [f.shape[2:] for f in feats]
+            else:
+                raise ValueError(f"Type de features non pris en charge : {type(feats)}")
+
+        return [(int(h), int(w)) for h, w in feature_maps]
 
     def forward(
         self, x: torch.Tensor, targets: Optional[Any] = None
@@ -97,7 +125,8 @@ class SSDDetector(BaseDetector):
         backbone_cfg = config.model.backbone
         backbone = build_backbone(
             name=backbone_cfg["type"],
-            out_indices=backbone_cfg.get("out_indices", [2, 3, 4])
+            out_indices=backbone_cfg.get("out_indices", ["c3", "c4", "c5"]),
+            **backbone_cfg.get("backbone_kwargs", {})
         )
 
         # 2. Neck
@@ -124,6 +153,7 @@ class SSDDetector(BaseDetector):
             neck=neck,
             head=head,
             num_classes=config.model.num_classes,
+            image_size = config.model.image_size,
             score_thresh=getattr(config.model, "score_thresh", 0.25),
             iou_thresh=getattr(config.model, "iou_thresh", 0.45),
         )

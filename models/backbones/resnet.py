@@ -37,7 +37,7 @@ class Bottleneck(nn.Module):
 
 class ResNetBackbone(BaseBackbone):
 
-    def __init__(self, out_indices: Tuple[str, ...] = ("c2", "c3", "c4", "c5")):
+    def __init__(self, out_indices: Tuple[str, ...] = ("c2", "c3", "c4", "c5"), **kwargs):
         super().__init__()
         self.in_planes = 64
         self.out_indices = set(out_indices)

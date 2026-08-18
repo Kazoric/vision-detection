@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional, List
+from typing import Any, Dict, Optional, List, Union, Tuple
 
 @dataclass
 class ExperimentConfig:
@@ -11,6 +11,7 @@ class ExperimentConfig:
 class ModelConfig:
     name: str
     num_classes: int
+    image_size: Union[int, List[int], Tuple[int, int]] = 300
     score_thresh: float = 0.25
     iou_thresh: float = 0.45
     # Dictionnaires de configuration pour la fabrique (build) des sous-modules
@@ -24,6 +25,7 @@ class ModelConfig:
         return cls(
             name=d["name"],
             num_classes=d["num_classes"],
+            image_size=d.get("image_size", [300, 300]),
             score_thresh=d.get("score_thresh", 0.25),
             iou_thresh=d.get("iou_thresh", 0.45),
             backbone=d.get("backbone", {}),
