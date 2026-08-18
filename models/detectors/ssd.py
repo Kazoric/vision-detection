@@ -139,7 +139,7 @@ class SSDDetector(BaseDetector):
                 extra_channels=config.model.neck.get("extra_channels", [512, 256, 256]),
             )
 
-        if hasattr(config.model, "neck") and config.model.neck is not None:
+        if hasattr(config.model, "head") and config.model.head is not None:
             head = build_head(
                 name=config.model.head["type"],
                 in_channels=neck.output_channels,
