@@ -1,12 +1,13 @@
 from typing import Any
 from .resnet import ResNetBackbone
 from .convnext import ConvNeXtBackbone
+from .convnextv2 import ConvNeXtV2Backbone
 
 # Dictionnaire de correspondance String -> Classe PyTorch
 BACKBONE_REGISTRY = {
     "ResNet": ResNetBackbone,
-    "ConvNeXt" : ConvNeXtBackbone
-    # "SSDResNet": SSDResNetModel,
+    "ConvNeXt" : ConvNeXtBackbone,
+    "ConvNeXtV2": ConvNeXtV2Backbone,
     # Ajoutez d'autres backbones ici au fur et à mesure (ex: "CSPDarknet", "EfficientNet")
 }
 
