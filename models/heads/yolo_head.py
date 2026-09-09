@@ -4,8 +4,10 @@ import torch
 import torch.nn as nn
 
 from .base import BaseHead
+from .registry import register_head
 
 
+@register_head("yolohead")
 class YoloHead(BaseHead):
     """
     Decoupled YOLO Detection Head module.

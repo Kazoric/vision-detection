@@ -2,8 +2,10 @@ import torch
 import torch.nn as nn
 from typing import Dict, Optional, Tuple, Union
 from models.heads.base import BaseHead
+from .registry import register_head
 
 
+@register_head("ssdhead")
 class SSDHead(BaseHead):
     """
     Task Head pour SSD (MultiBox Head).

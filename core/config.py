@@ -10,6 +10,7 @@ class ExperimentConfig:
 @dataclass
 class ModelConfig:
     name: str
+    type: str
     num_classes: int
     image_size: Union[int, List[int], Tuple[int, int]] = 300
     score_thresh: float = 0.25
@@ -24,6 +25,7 @@ class ModelConfig:
     def from_dict(cls, d: Dict[str, Any]) -> "ModelConfig":
         return cls(
             name=d["name"],
+            type=d["type"],
             num_classes=d["num_classes"],
             image_size=d.get("image_size", [300, 300]),
             score_thresh=d.get("score_thresh", 0.25),

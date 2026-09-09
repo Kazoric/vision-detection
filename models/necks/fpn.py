@@ -5,8 +5,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .base import BaseNeck
+from .registry import register_neck
 
-
+@register_neck("fpn")
 class FPN(BaseNeck):
     """
     Feature Pyramid Network (FPN) neck implementation.

@@ -2,8 +2,10 @@ import torch
 import torch.nn as nn
 from typing import Dict, List
 from models.necks.base import BaseNeck
+from .registry import register_neck
 
 
+@register_neck("ssdneck")
 class SSD300Neck(BaseNeck):
     """
     Neck spécifique à SSD300 :

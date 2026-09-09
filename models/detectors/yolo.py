@@ -13,8 +13,10 @@ from models.heads import build_head
 from models.heads.yolo_head import YoloHead
 from loss.yolo_loss import YoloLoss
 from .base import BaseDetector
+from .registry import register_detector
 
 
+@register_detector("yolo")
 class Yolo(BaseDetector):
     """
     YOLO Object Detector integrating Backbone, Neck, Decoupled Head, 

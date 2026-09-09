@@ -5,20 +5,16 @@ import torch.nn.functional as F
 from torchvision.ops import batched_nms
 
 from models.detectors.base import BaseDetector
-from models.backbones.base import BaseBackbone
 from models.backbones import build_backbone
-from models.necks.base import BaseNeck
 from models.necks import build_neck
-from models.heads.base import BaseHead
 from models.heads import build_head
-from models.backbones.resnet import ResNetBackbone
-from models.necks.ssd_neck import SSD300Neck
-from models.heads.ssd_head import SSDHead
 
 from loss.ssd_loss import SSDMultiBoxLoss
 from utils.ssd_utils import generate_ssd_priors
+from .registry import register_detector
 
 
+@register_detector("ssd")
 class SSDDetector(BaseDetector):
     """
     Détecteur SSD300 complet (Single Shot MultiBox Detector).

@@ -3,6 +3,7 @@ from torch import nn
 from typing import List, Dict, Optional, Tuple
 
 from .base import BaseBackbone
+from .registry import register_backbone
 
 class Bottleneck(nn.Module):
     """ Bloc ResNet Bottleneck standard """
@@ -35,6 +36,7 @@ class Bottleneck(nn.Module):
         out += identity
         return self.relu(out)
 
+@register_backbone("resnet")
 class ResNetBackbone(BaseBackbone):
 
     def __init__(self, out_indices: Tuple[str, ...] = ("c2", "c3", "c4", "c5"), **kwargs):

@@ -4,6 +4,7 @@ import torch.nn.functional as F
 from typing import Tuple, Optional, List, Dict, Any
 
 from .base import BaseBackbone
+from .registry import register_backbone
 
 # --- ConvNeXt Utilities ---
 
@@ -99,6 +100,7 @@ class ConvNeXtBlock(nn.Module):
         return x
 
 
+@register_backbone("convnext")
 class ConvNeXtBackbone(BaseBackbone):
     """ConvNeXt Architecture."""
 
