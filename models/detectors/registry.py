@@ -32,7 +32,7 @@ def build_detector(config) -> Any:
     Args:
         config: full Config object, passed as-is to cls.from_config().
     """
-    model_type = config.model.type.lower()
+    model_type = config.model.detector["type"].lower()
     if model_type not in DETECTOR_REGISTRY:
         raise ValueError(
             f"Unknown detector '{model_type}'. "

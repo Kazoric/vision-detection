@@ -251,6 +251,7 @@ class Yolo(BaseDetector):
             )
 
         # 3. Modèle YOLO Anchor-Free
+        detector_cfg = config.model.detector
         return cls(
             backbone=backbone,
             neck=neck,
@@ -258,5 +259,5 @@ class Yolo(BaseDetector):
             num_classes=model_cfg.num_classes,
             score_thresh=getattr(model_cfg, "score_thresh", 0.25),
             iou_thresh=getattr(model_cfg, "iou_thresh", 0.45),
-            strides=getattr(model_cfg, "strides", [8, 16, 32]),
+            **detector_cfg.get("detector_kwargs", {}),
         )

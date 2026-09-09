@@ -9,8 +9,6 @@ class ExperimentConfig:
 
 @dataclass
 class ModelConfig:
-    name: str
-    type: str
     num_classes: int
     image_size: Union[int, List[int], Tuple[int, int]] = 300
     score_thresh: float = 0.25
@@ -19,21 +17,19 @@ class ModelConfig:
     backbone: Dict[str, Any] = field(default_factory=dict)
     neck: Optional[Dict[str, Any]] = None
     head: Optional[Dict[str, Any]] = None
-    strides: List[int] = field(default_factory=lambda: [8, 16, 32])  # P3=8, P4=16, P5=32
+    detector: Dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "ModelConfig":
         return cls(
-            name=d["name"],
-            type=d["type"],
             num_classes=d["num_classes"],
-            image_size=d.get("image_size", [300, 300]),
+            image_size=d.get("image_size", [320, 320]),
             score_thresh=d.get("score_thresh", 0.25),
             iou_thresh=d.get("iou_thresh", 0.45),
             backbone=d.get("backbone", {}),
             neck=d.get("neck"),
             head=d.get("head"),
-            strides=d.get("strides", [8, 16, 32]),
+            detector=d.get("detector"),
         )
 
 @dataclass
