@@ -1,44 +1,39 @@
 import os
+import json
+from typing import Tuple, Optional, List
+
 import torch
 from PIL import Image
-import torchvision.transforms as T
-from typing import Tuple, Optional
-import json
-
 from torch.utils.data import Dataset, DataLoader
-from torchvision import transforms
-from typing import Tuple, Optional, List
+from torchvision.transforms import v2
+from torchvision import tv_tensors
+
 
 class GenericYOLODataset(Dataset):
     """
-    Dataset générique pour charger des images et des annotations au format YOLO 
-    et les convertir au format attendu par les modèles de détection PyTorch.
+    Generic dataset for loading images + YOLO-format annotations and
+    converting them to the format expected by PyTorch detection models.
     """
     def __init__(
-        self, 
-        img_dir: str, 
-        label_dir: str, 
-        transform: Optional[T.Compose] = None, 
+        self,
+        img_dir: str,
+        label_dir: str,
+        transform: Optional[v2.Transform] = None,
         target_size: Tuple[int, int] = (300, 300),
         bg_offset: int = 0
     ):
-        """
-        Args:
-            img_dir (str): Chemin vers le dossier contenant les images.
-            label_dir (str): Chemin vers le dossier contenant les fichiers .txt (YOLO).
-            transform (callable, optional): Pipeline de transformations torchvision.
-            target_size (tuple): Taille de redimensionnement cible (Largeur, Hauteur).
-            bg_offset (int): Décalage à appliquer aux IDs de classe (1 par défaut car 0 = Background en PyTorch).
-        """
         self.img_dir = img_dir
         self.label_dir = label_dir
         self.target_size = target_size
         self.bg_offset = bg_offset
-        
-        # On accepte le transform externe, sinon conversion minimale en tenseur
-        self.transform = transform if transform is not None else T.ToTensor()
-        
-        # Filtrer et trier les images valides pour garantir l'alignement
+
+        # Fallback: no augmentation, just tensor conversion.
+        self.transform = transform if transform is not None else v2.Compose([
+            v2.Resize(target_size),
+            v2.ToImage(),
+            v2.ToDtype(torch.float32, scale=True),
+        ])
+
         valid_extensions = ('.png', '.jpg', '.jpeg', '.webp', '.bmp')
         self.img_names = sorted([
             f for f in os.listdir(img_dir) if f.lower().endswith(valid_extensions)
@@ -48,18 +43,14 @@ class GenericYOLODataset(Dataset):
         return len(self.img_names)
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, dict]:
-        # 1. Chargement de l'image
         img_name = self.img_names[idx]
         img_path = os.path.join(self.img_dir, img_name)
         image = Image.open(img_path).convert("RGB")
+        orig_w, orig_h = image.size  # boxes are now computed in ORIGINAL pixel space
 
-        # 2. Application des transformations (Redimensionnement automatique inclus si présent dans le transform)
-        image_tensor = self.transform(image)
-
-        # 3. Recherche du fichier de label YOLO associé (même nom, extension .txt)
         label_name = os.path.splitext(img_name)[0] + ".txt"
         label_path = os.path.join(self.label_dir, label_name)
-        
+
         boxes = []
         labels = []
 
@@ -69,51 +60,49 @@ class GenericYOLODataset(Dataset):
                     parts = line.strip().split()
                     if len(parts) != 5:
                         continue
-                        
-                    # Format YOLO officiel : class_id, x_center, y_center, width, height (normalisés entre 0 et 1)
+
                     class_id = int(parts[0])
                     x_c, y_c, w, h = map(float, parts[1:])
 
-                    # Conversion 1 : YOLO -> Pascal VOC (coordonnées normalisées xmin, ymin, xmax, ymax)
-                    xmin = x_c - w / 2
-                    ymin = y_c - h / 2
-                    xmax = x_c + w / 2
-                    ymax = y_c + h / 2
-
-                    # Conversion 2 : Normalisé [0, 1] -> Pixel absolu (ex: basculer sur l'échelle 300x300)
-                    xmin *= self.target_size[0]
-                    ymin *= self.target_size[1]
-                    xmax *= self.target_size[0]
-                    ymax *= self.target_size[1]
+                    # YOLO normalized -> pixel coords in the ORIGINAL image.
+                    xmin = (x_c - w / 2) * orig_w
+                    ymin = (y_c - h / 2) * orig_h
+                    xmax = (x_c + w / 2) * orig_w
+                    ymax = (y_c + h / 2) * orig_h
 
                     boxes.append([xmin, ymin, xmax, ymax])
-                    
-                    # Appliquer le décalage pour le Background de PyTorch (class_id + 1)
                     labels.append(class_id + self.bg_offset)
 
-        # Gestion des images de fond (sans aucun objet détecté)
-        if len(boxes) == 0:
-            target_boxes = torch.zeros((0, 4), dtype=torch.float32)
-            target_labels = torch.zeros(0, dtype=torch.int64)
-        else:
-            target_boxes = torch.tensor(boxes, dtype=torch.float32)
-            target_labels = torch.tensor(labels, dtype=torch.int64)
+        boxes_tensor = torch.tensor(boxes, dtype=torch.float32) if boxes else torch.zeros((0, 4), dtype=torch.float32)
+        labels_tensor = torch.tensor(labels, dtype=torch.int64) if labels else torch.zeros(0, dtype=torch.int64)
+
+        # Wrapping boxes as a tv_tensor is what lets v2 transforms detect them
+        # and apply the same geometric transform as the image (flip, rotate,
+        # crop, resize...) instead of leaving them untouched.
+        bboxes = tv_tensors.BoundingBoxes(
+            boxes_tensor, format="XYXY", canvas_size=(orig_h, orig_w)
+        )
+
+        sample = {"image": image, "boxes": bboxes, "labels": labels_tensor}
+        sample = self.transform(sample)
 
         target = {
-            "boxes": target_boxes,
-            "labels": target_labels
+            "boxes": sample["boxes"],
+            "labels": sample["labels"],
         }
-
-        return image_tensor, target
-    
+        return sample["image"], target
 
 
 def detection_collate_fn(batch):
     return tuple(zip(*batch))
 
+
 def compute_mean_std(img_dir: str, label_dir: str, batch_size: int = 32, image_size: Tuple[int, int] = (300, 300)) -> Tuple[List[float], List[float]]:
-    # Utilise le dataset générique en mode brut pour calculer les stats
-    base_transform = transforms.Compose([transforms.Resize(image_size), transforms.ToTensor()])
+    base_transform = v2.Compose([
+        v2.Resize(image_size),
+        v2.ToImage(),
+        v2.ToDtype(torch.float32, scale=True),
+    ])
     dataset = GenericYOLODataset(img_dir=img_dir, label_dir=label_dir, transform=base_transform, target_size=image_size)
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=detection_collate_fn, num_workers=2)
 
@@ -132,44 +121,51 @@ def compute_mean_std(img_dir: str, label_dir: str, batch_size: int = 32, image_s
     std = (sum_sq / n_pixels - mean ** 2).sqrt()
     return mean.tolist(), std.tolist()
 
+
 def get_transforms(image_size: Tuple[int, int], mean: Optional[List[float]], std: Optional[List[float]]):
     if mean is None: mean = [0.485, 0.456, 0.406]
     if std is None: std = [0.229, 0.224, 0.225]
 
-    train_transform = transforms.Compose([
-        transforms.Resize(image_size),
-        transforms.ColorJitter(brightness=0.5, contrast=0.3, saturation=0.3, hue=0.3),
-        # transforms.RandomHorizontalFlip(p=0.5),
-        # transforms.RandomRotation(15),
-        # transforms.RandomResizedCrop(image_size, scale=(0.5, 1.0)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean, std),
+    train_transform = v2.Compose([
+        v2.Resize(image_size),
+        v2.RandomHorizontalFlip(p=0.5),
+        # v2.RandomRotation(15),
+        v2.RandomResizedCrop(image_size, scale=(0.85, 1.0)),
+        v2.ColorJitter(brightness=0.5, contrast=0.3, saturation=0.3, hue=0.3),
+        # Drops boxes that became degenerate (zero area, fully out of frame)
+        # after crop/rotation — must run after the geometric transforms above.
+        v2.SanitizeBoundingBoxes(),
+        v2.ToImage(),
+        v2.ToDtype(torch.float32, scale=True),
+        v2.Normalize(mean, std),
     ])
-    val_transform = transforms.Compose([
-        transforms.Resize(image_size),
-        transforms.ToTensor(),
-        transforms.Normalize(mean, std),
+    val_transform = v2.Compose([
+        v2.Resize(image_size),
+        v2.ToImage(),
+        v2.ToDtype(torch.float32, scale=True),
+        v2.Normalize(mean, std),
     ])
     return train_transform, val_transform
 
+
 def get_detection_loaders(
-    dataset_root: str,  # Exemple: "data/Chess" ou "data/Vehicles"
+    dataset_root: str,
     batch_size: int = 4,
     num_workers: int = 2,
     image_size: Tuple[int, int] = (300, 300),
     use_computed_stats: bool = True
 ) -> Tuple[DataLoader, DataLoader]:
-    
+
     train_img_dir = os.path.join(dataset_root, "train", "images")
     train_label_dir = os.path.join(dataset_root, "train", "labels")
-    
+
     val_img_dir = os.path.join(dataset_root, "valid", "images")
     val_label_dir = os.path.join(dataset_root, "valid", "labels")
     if not os.path.exists(val_img_dir):
         val_img_dir, val_label_dir = train_img_dir, train_label_dir
 
     stats_path = os.path.join(dataset_root, "stats.json")
-    
+
     if use_computed_stats:
         if os.path.exists(stats_path):
             with open(stats_path, "r") as f:
@@ -184,7 +180,6 @@ def get_detection_loaders(
 
     train_transform, val_transform = get_transforms(image_size, mean, std)
 
-    # Instanciation générique
     train_set = GenericYOLODataset(img_dir=train_img_dir, label_dir=train_label_dir, transform=train_transform, target_size=image_size)
     val_set = GenericYOLODataset(img_dir=val_img_dir, label_dir=val_label_dir, transform=val_transform, target_size=image_size)
 
