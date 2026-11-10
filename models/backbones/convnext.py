@@ -74,8 +74,7 @@ class ConvNeXtBlock(nn.Module):
         self.pwconv2 = nn.Linear(4 * dim, dim)
         
         # 4. Layer Scale and Stochastic Depth
-        self.gamma = nn.Parameter(layer_scale_init_value * torch.ones((dim)), 
-                                    requires_grad=True) if layer_scale_init_value > 0 else None
+        self.gamma = nn.Parameter(layer_scale_init_value * torch.ones((dim)), requires_grad=True) if layer_scale_init_value > 0 else None
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
 
     def forward(self, x):
@@ -109,6 +108,7 @@ class ConvNeXtBackbone(BaseBackbone):
         depths: List[int],
         dims: List[int],
         drop_path_rate: float = 0.0,
+        layer_scale_init_value: float = 1e-6,
         out_indices: Tuple[str, ...] = ("c2", "c3", "c4", "c5"),
         **kwargs
     ):
@@ -121,83 +121,65 @@ class ConvNeXtBackbone(BaseBackbone):
             nn.Conv2d(3, dims[0], kernel_size=4, stride=4),
             LayerNorm(dims[0], eps=1e-6, data_format="channels_first")
         )
+
+        # 2. Stochastic depth rates distributed across blocks
+        dp_rates = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]
+        cur_dp = 0
+
+        # 3. Stages
+        stages_list = []
+        in_dim = dims[0]
+        for i, (out_dim, depth) in enumerate(zip(dims, depths)):
+            stage_dp_rates = dp_rates[cur_dp : cur_dp + depth]
+            cur_dp += depth
+            
+            stage = self._make_stage(in_dim=in_dim, out_dim=out_dim, depth=depth, dp_rates=stage_dp_rates, is_first=(i == 0), layer_scale_init_value=layer_scale_init_value)
+            stages_list.append(stage)
+            in_dim = out_dim
+
+        self.stages = nn.Sequential(*stages_list)
         
-        # 2. Downsampling layers between stages
-        self.downsample_layer2 = nn.Sequential(
-                LayerNorm(dims[0], eps=1e-6, data_format="channels_first"),
-                nn.Conv2d(dims[0], dims[0+1], kernel_size=2, stride=2),
-        )
-        self.downsample_layer3 = nn.Sequential(
-                LayerNorm(dims[1], eps=1e-6, data_format="channels_first"),
-                nn.Conv2d(dims[1], dims[1+1], kernel_size=2, stride=2),
-        )
-        self.downsample_layer4 = nn.Sequential(
-                LayerNorm(dims[2], eps=1e-6, data_format="channels_first"),
-                nn.Conv2d(dims[2], dims[2+1], kernel_size=2, stride=2),
-        )
-
-        # 3. ConvNeXt stages (sequence of blocks)
-        dp_rates = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))] 
-        cur = 0
-
-        self.stage1 = nn.Sequential(
-            *[ConvNeXtBlock(dim=dims[0], drop_path=dp_rates[cur + j]) 
-                for j in range(depths[0])]
-        )
-        cur += depths[0]
-        self.stage2 = nn.Sequential(
-            *[ConvNeXtBlock(dim=dims[1], drop_path=dp_rates[cur + j]) 
-                for j in range(depths[1])]
-        )
-        cur += depths[1]
-        self.stage3 = nn.Sequential(
-            *[ConvNeXtBlock(dim=dims[2], drop_path=dp_rates[cur + j]) 
-                for j in range(depths[2])]
-        )
-        cur += depths[2]
-        self.stage4 = nn.Sequential(
-            *[ConvNeXtBlock(dim=dims[3], drop_path=dp_rates[cur + j]) 
-                for j in range(depths[3])]
-        )
-        cur += depths[3]
-
-        # Init weights
-        self.apply(self._init_weights)
-
-    def _init_weights(self, m):
-        if isinstance(m, nn.Conv2d):
-            nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
-            if m.bias is not None:
-                nn.init.zeros_(m.bias)
-
-        elif isinstance(m, nn.Linear):
-            nn.init.trunc_normal_(m.weight, std=0.02)
-            if m.bias is not None:
-                nn.init.zeros_(m.bias)
+        self._init_weights()
 
 
-    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
-        outputs = {}
-        # Iterate through the 4 stages (pyramidal architecture)
+    def _make_stage(self, in_dim: int, out_dim: int, depth: int, dp_rates: List[float], is_first: bool, layer_scale_init_value: float) -> nn.Sequential:
+        layers = []
+        # Downsampling between stages (except for the first stage handled by the stem)
+        if not is_first:
+            layers.append(
+                nn.Sequential(
+                    LayerNorm(in_dim, eps=1e-6, data_format="channels_first"),
+                    nn.Conv2d(in_dim, out_dim, kernel_size=2, stride=2)
+                )
+            )
+
+        # ConvNeXt blocks
+        for j in range(depth):
+            layers.append(ConvNeXtBlock(dim=out_dim, drop_path=dp_rates[j], layer_scale_init_value=layer_scale_init_value))
+        return nn.Sequential(*layers)
+
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, (nn.Conv2d, nn.Linear)):
+                nn.init.trunc_normal_(m.weight, std=0.02)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.stem(x)
-        c2 = self.stage1(x)
-        if "c2" in self.out_indices: outputs["c2"] = c2
 
-        x = self.downsample_layer2(c2)
-        c3 = self.stage2(x)
-        if "c3" in self.out_indices: outputs["c3"] = c3
+        outputs = {}
+        stage_names = ("c2", "c3", "c4", "c5")
 
-        x = self.downsample_layer3(c3)
-        c4 = self.stage3(x)
-        if "c4" in self.out_indices: outputs["c4"] = c4
+        for name, stage in zip(stage_names, self.stages):
+            x = stage(x)
+            if name in self.out_indices:
+                outputs[name] = x
 
-        x = self.downsample_layer4(c4)
-        c5 = self.stage4(x)
-        if "c5" in self.out_indices: outputs["c5"] = c5
-
-        # for i, f in enumerate(outputs):
-        #     print(f, outputs[f].shape)
         return outputs
+    
 
     @property
     def output_channels(self) -> Dict[str, int]:
